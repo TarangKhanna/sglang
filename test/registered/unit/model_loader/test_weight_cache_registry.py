@@ -5,10 +5,12 @@ test_weight_cache_protocol.py in this same directory.
 """
 
 import fcntl
+import gc
 import os
 import signal
 import tempfile
 import unittest
+import weakref
 from unittest import mock
 
 from sglang.srt.weight_cache import registry
@@ -52,6 +54,7 @@ def _config(**overrides) -> CacheConfig:
         "resolved_revision": "",
         "device_capability": "8.0",
         "torch_version": "2.5.1",
+        "sglang_version": "0.4.0",
         "load_format": "auto",
         "model_loader_extra_config_hash": "",
         "trust_remote_code": False,
@@ -115,6 +118,35 @@ class TestIdentityLock(CustomTestCase):
             self.assertTrue(contender.acquire(fcntl.LOCK_EX))
             contender.release()
 
+    def test_rejects_repeated_acquire_without_leaking_the_first_fd(self):
+        identity = identity_for(_config(), "GPU-repeat")
+        with tempfile.TemporaryDirectory(
+            dir="/tmp", prefix="wc-"
+        ) as runtime_dir, mock.patch.object(registry, "_RUNTIME_DIR", runtime_dir):
+            claim = IdentityLock(identity)
+            self.assertTrue(claim.acquire(fcntl.LOCK_EX))
+            first_fd = claim.fd
+            with self.assertRaisesRegex(RuntimeError, "already acquired"):
+                claim.acquire(fcntl.LOCK_EX)
+            self.assertEqual(claim.fd, first_fd)
+            claim.release()
+
+    def test_discarded_claim_does_not_retain_a_lock_or_callback(self):
+        identity = identity_for(_config(), "GPU-discarded-claim")
+        with tempfile.TemporaryDirectory(
+            dir="/tmp", prefix="wc-"
+        ) as runtime_dir, mock.patch.object(registry, "_RUNTIME_DIR", runtime_dir):
+            claim = IdentityLock(identity)
+            self.assertTrue(claim.acquire(fcntl.LOCK_EX))
+            reference = weakref.ref(claim)
+            del claim
+            gc.collect()
+            self.assertIsNone(reference())
+
+            contender = IdentityLock(identity)
+            self.assertTrue(contender.acquire(fcntl.LOCK_EX))
+            contender.release()
+
     def test_multiple_shared_claimants_coexist(self):
         # Concurrent disk-fallback clients (or a fallback client racing a
         # not-yet-claimed daemon) must not exclude each other -- only an
@@ -148,10 +180,8 @@ class TestIdentityLock(CustomTestCase):
             gpu_b.release()
 
     def test_same_gpu_uuid_different_config_do_not_contend(self):
-        # A differently-configured daemon on the same physical GPU (e.g. a
-        # config change across a restart racing the old daemon's teardown)
-        # is a distinct identity with its own lock -- see protocol.py's
-        # CacheConfig docstring.
+        # A config change racing the old daemon's teardown must not contend
+        # with it -- different config on the same GPU is a distinct identity.
         with tempfile.TemporaryDirectory(
             dir="/tmp", prefix="wc-"
         ) as runtime_dir, mock.patch.object(registry, "_RUNTIME_DIR", runtime_dir):

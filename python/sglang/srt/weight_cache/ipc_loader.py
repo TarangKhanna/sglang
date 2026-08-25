@@ -129,22 +129,20 @@ class IpcModelLoader(BaseModelLoader):
                     self._fallback_claim.release()
                     self._fallback_claim = None
                 raise
-            # Deliberately not released: the weights are resident on this GPU
-            # under this identity, so a daemon claiming it later would load a
-            # duplicate copy. The OS releases the flock at process exit, same
-            # as the daemon's own claim. Assumes this process never replaces
-            # these weights in place (e.g. a live weight-update RPC) without
-            # also exiting -- otherwise the claim outlives the resident
-            # weights and over-conservatively blocks a future daemon.
+            # Deliberately not released: these weights are resident on this
+            # GPU under this identity, so a daemon claiming it later would
+            # load a duplicate copy. Released at process exit, like the
+            # daemon's own claim.
             return model
 
-        # Start monitoring before constructing the meta model or importing any
-        # tensor handles. The synchronous liveness check closes the post-
-        # handshake/pre-import window as far as PID identity probing allows;
-        # the thread then protects the lifetime of the mapped model.
+        # Check synchronously before importing any handles. A long-lived watcher
+        # starts only after model construction has succeeded, so a failed import
+        # cannot leave an orphan watcher behind.
         daemon_metadata = cache_data["daemon"]
-        self._start_daemon_liveness_watchdog(
-            daemon_metadata["pid"], daemon_metadata["process_start_time"]
+        daemon_pid = daemon_metadata["pid"]
+        daemon_start_time = daemon_metadata["process_start_time"]
+        self._require_daemon_alive(
+            daemon_pid, daemon_start_time, "before tensor import"
         )
 
         entries = cache_data["entries"]
@@ -177,6 +175,8 @@ class IpcModelLoader(BaseModelLoader):
         # replaced via IPC mapping, these views still point to the old
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
+        self._require_daemon_alive(daemon_pid, daemon_start_time, "after tensor import")
+        self._start_daemon_liveness_watchdog(daemon_pid, daemon_start_time)
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
@@ -185,18 +185,21 @@ class IpcModelLoader(BaseModelLoader):
 
         return model.eval()
 
+    @staticmethod
+    def _require_daemon_alive(
+        daemon_pid: int, process_start_time: float, phase: str
+    ) -> None:
+        if not process_identity_is_alive(daemon_pid, process_start_time):
+            raise RuntimeError(
+                f"[IpcModelLoader] Weight cache daemon pid={daemon_pid} died {phase}"
+            )
+
     def _start_daemon_liveness_watchdog(
         self,
         daemon_pid: int,
         process_start_time: float,
     ) -> None:
         """Terminate if the producer dies while this process holds its tensors."""
-
-        if not process_identity_is_alive(daemon_pid, process_start_time):
-            raise RuntimeError(
-                f"[IpcModelLoader] Weight cache daemon pid={daemon_pid} died "
-                "after the handshake and before tensor import"
-            )
 
         def _watch() -> None:
             while True:
@@ -442,6 +445,7 @@ class IpcModelLoader(BaseModelLoader):
 
     def _build_engine_config(self, model_config, device_id: int) -> CacheConfig:
         from sglang.srt.runtime_context import get_exec, get_parallel
+        from sglang.version import __version__ as sglang_version
 
         ps = get_parallel()
         quant_method, quant_config = self._resolve_engine_quant(model_config)
@@ -481,6 +485,7 @@ class IpcModelLoader(BaseModelLoader):
                 self.load_config.model_loader_extra_config
             ),
             trust_remote_code=self.load_config.weight_cache_trust_remote_code,
+            sglang_version=sglang_version,
             **compute_env_stamp(device_id),
         )
 
@@ -544,7 +549,8 @@ class IpcModelLoader(BaseModelLoader):
                 self._fallback_claim = claim
                 return True
 
-        deadline = time.monotonic() + CLIENT_READY_TIMEOUT_S
+        timeout_s = self.load_config.weight_cache_timeout or CLIENT_READY_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if not is_daemon_mode:
                 claim = IdentityLock(identity)
@@ -566,7 +572,7 @@ class IpcModelLoader(BaseModelLoader):
 
         raise RuntimeError(
             f"[IpcModelLoader] weight-cache owner for {identity.key} never "
-            f"became ready within {CLIENT_READY_TIMEOUT_S:.1f}s"
+            f"became ready within {timeout_s:.1f}s"
             + (
                 "; refusing to disk-load a second copy of the same weights "
                 f"onto the same GPU. Holder: {lock_holder_diagnostics(identity)}"
@@ -581,39 +587,13 @@ class IpcModelLoader(BaseModelLoader):
 
         from sglang.srt.platforms import current_platform
 
-        socket_path = self.socket_path
-
-        # Preserve the explicit-override fast miss: it bypasses both discovery
-        # access and parallel/config inspection when the named socket is absent.
-        if socket_path is not None:
-            try:
-                explicit_info = os.lstat(socket_path)
-            except FileNotFoundError:
-                logger.info(
-                    f"[IpcModelLoader] Daemon socket not found at {socket_path}."
-                )
-                return None
-            if (
-                not stat.S_ISSOCK(explicit_info.st_mode)
-                or explicit_info.st_uid != os.getuid()
-            ):
-                raise RuntimeError(
-                    f"[IpcModelLoader] Refusing to connect: {socket_path} is not "
-                    f"a socket owned by this user."
-                )
-
         # DeviceConfig is required for every real load path. Do not silently
         # substitute GPU 0: physical-device identity is the cache key.
         device_id = int(device_config.gpu_id)
         engine_config = self._build_engine_config(model_config, device_id)
         device_uuid = current_platform.get_device_uuid(device_id)
-        identity = None
-
-        # An explicit socket is an intentional escape hatch and never touches
-        # identity discovery or its claim. Otherwise both peers derive one path.
-        if socket_path is None:
-            identity = identity_for(engine_config, device_uuid)
-            socket_path = identity_socket_path(identity)
+        identity = identity_for(engine_config, device_uuid)
+        socket_path = self.socket_path or identity_socket_path(identity)
 
         # Only connect to a real socket node owned by us: reject a symlink, a
         # plain file, or another user's socket planted at this /tmp path. An
@@ -621,9 +601,8 @@ class IpcModelLoader(BaseModelLoader):
         try:
             st = os.lstat(socket_path)
         except FileNotFoundError:
-            if identity is not None:
-                if not self._claim_fallback_or_wait(identity, socket_path):
-                    return self._fetch_from_cache(model_config, device_config)
+            if not self._claim_fallback_or_wait(identity, socket_path):
+                return self._fetch_from_cache(model_config, device_config)
             logger.info(f"[IpcModelLoader] Daemon socket not found at {socket_path}.")
             return None
         if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
@@ -638,24 +617,18 @@ class IpcModelLoader(BaseModelLoader):
             sock.connect(socket_path)
         except FileNotFoundError:
             sock.close()
-            if identity is not None and not self._claim_fallback_or_wait(
+            if not self._claim_fallback_or_wait(
                 identity, socket_path, allow_ready_socket=False
             ):
                 return self._fetch_from_cache(model_config, device_config)
             return None
         except ConnectionRefusedError:
             sock.close()
-            if identity is not None and not self._claim_fallback_or_wait(
+            if not self._claim_fallback_or_wait(
                 identity, socket_path, allow_ready_socket=False
             ):
                 return self._fetch_from_cache(model_config, device_config)
-            if identity is not None:
-                return None
-            raise RuntimeError(
-                f"[IpcModelLoader] Daemon socket exists at {socket_path} but "
-                f"refused the connection. The daemon may have crashed after "
-                f"creating the socket. Check daemon logs."
-            )
+            return None
         except Exception as e:
             sock.close()
             raise RuntimeError(
@@ -698,17 +671,20 @@ class IpcModelLoader(BaseModelLoader):
 
             return result
 
-        except Exception as e:
-            if identity is not None:
-                if not self._claim_fallback_or_wait(
-                    identity, socket_path, allow_ready_socket=False
-                ):
-                    return self._fetch_from_cache(model_config, device_config)
-                return None
-            raise RuntimeError(
-                f"[IpcModelLoader] Error communicating with daemon at "
-                f"{socket_path}: {e}"
-            ) from e
+        except (ConnectionError, OSError) as e:
+            # Only a transport failure implies the producer may have died and
+            # released EX. A declared mismatch or bad response is a real error
+            # and should propagate, not get swallowed into a disk load.
+            if not self._claim_fallback_or_wait(
+                identity, socket_path, allow_ready_socket=False
+            ):
+                return self._fetch_from_cache(model_config, device_config)
+            logger.warning(
+                "[IpcModelLoader] Daemon communication failed and its identity "
+                "claim was released; falling back to a private disk load: %s",
+                e,
+            )
+            return None
         finally:
             sock.close()
 

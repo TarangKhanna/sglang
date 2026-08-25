@@ -44,6 +44,7 @@ CACHE_IDENTITY_FIELDS = (
     "resolved_revision",
     "device_capability",
     "torch_version",
+    "sglang_version",
     "load_format",
     "model_loader_extra_config_hash",
     "trust_remote_code",
@@ -94,6 +95,7 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    sglang_version: str  # exact build; restart a daemon across an upgrade
     load_format: str  # disk/source loader whose output is cached
     model_loader_extra_config_hash: str  # full SHA-256 of canonical loader options
     trust_remote_code: bool  # remote model code can change loaded tensor layout

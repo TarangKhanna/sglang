@@ -68,7 +68,6 @@ from .protocol import (
     send_msg,
 )
 from .registry import (
-    DAEMON_CLAIM_TIMEOUT_S,
     CacheIdentity,
     IdentityLock,
     identity_for,
@@ -165,11 +164,8 @@ class WeightCacheDaemon:
         self.attn_cp_size = server_args.attn_cp_size
         self.moe_dense_tp_size = server_args.moe_dense_tp_size
         self.moe_a2a_backend = server_args.moe_a2a_backend
-        # Snapshotted for the resolved-startup-layout record like the fields
-        # above, but deliberately not part of CacheConfig/the identity
-        # fingerprint: deepep_mode only selects a runtime MoE token-dispatch
-        # path (token_dispatcher/deepep.py) and never touches exported
-        # tensor values, so a mismatch can't produce wrong-numerics weights.
+        # Not part of CacheConfig: deepep_mode only picks a runtime MoE
+        # dispatch path and never affects exported tensor values.
         self.deepep_mode = server_args.deepep_mode
         self.load_format = server_args.load_format
         self.dtype = server_args.dtype
@@ -280,6 +276,7 @@ class WeightCacheDaemon:
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
+        from sglang.version import __version__ as sglang_version
 
         server_args = self.server_args
         # ServerArgs resolves source-specific "auto" values (for example
@@ -322,12 +319,8 @@ class WeightCacheDaemon:
         # attempting to serialize vendor-specific quantization objects.
         check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
-        # moe_dp_rank/moe_ep_rank are only known after this rank joins its MoE
-        # process groups, so the identity claim waits until after this call --
-        # still well before load_model(), the expensive step it protects.
-        # Two launches reusing the same rendezvous address is a caller
-        # configuration error, same as for any other distributed launch in
-        # this codebase -- distinct launches must use distinct endpoints.
+        # moe_dp_rank/moe_ep_rank are only known once this rank joins its MoE
+        # process groups, so the identity claim waits until after this call.
         self._init_distributed(server_args, model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
@@ -363,6 +356,7 @@ class WeightCacheDaemon:
                 self.model_loader_extra_config
             ),
             trust_remote_code=self.trust_remote_code,
+            sglang_version=sglang_version,
             **compute_env_stamp(self.gpu_id),
         )
 
@@ -373,10 +367,12 @@ class WeightCacheDaemon:
         identity = identity_for(self.config, self.device_uuid)
         listener_path = socket_path(identity)
         claim_lock = IdentityLock(identity)
-        if not claim_lock.acquire(fcntl.LOCK_EX, DAEMON_CLAIM_TIMEOUT_S):
+        claim_timeout_s = server_args.weight_cache_timeout
+        if not claim_lock.acquire(fcntl.LOCK_EX, claim_timeout_s):
             raise RuntimeError(
                 "timed out waiting for weight-cache claim "
-                f"{identity.key}: {lock_holder_diagnostics(identity)}"
+                f"{identity.key} after {claim_timeout_s:.1f}s: "
+                f"{lock_holder_diagnostics(identity)}"
             )
         self.identity = identity
         self.claim_lock = claim_lock
@@ -632,16 +628,15 @@ class WeightCacheDaemon:
             )
 
     def shutdown(self):
-        """Stop serving and leave exported tensors alive until process exit."""
+        """Stop serving. EX stays held until process exit -- the caching
+        allocator doesn't free VRAM just because Python drops the refs, so
+        releasing the lock here would let a replacement claim while this
+        process still occupies the GPU."""
         self._running = False
         if dist.is_initialized():
             dist.destroy_process_group()
         self.state_entries.clear()
         self.model = None
-        # Releasing EX is the public signal that this identity's weight state
-        # is gone; doing so before clearing tensors permits double residency.
-        if self.claim_lock is not None:
-            self.claim_lock.release()
 
 
 def run_weight_cache_daemon(

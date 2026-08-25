@@ -1,6 +1,8 @@
 import os
+import socket
 import subprocess
 import sys
+import time
 import unittest
 
 import requests
@@ -42,6 +44,80 @@ PROMPTS = [
 ]
 
 
+def _cache_socket_paths() -> set[str]:
+    from pathlib import Path
+
+    from sglang.srt.weight_cache.registry import default_runtime_dir
+
+    return {str(path) for path in Path(default_runtime_dir()).glob("*.sock")}
+
+
+def _wait_for_daemon_sockets(
+    daemon_process: subprocess.Popen,
+    expected_count: int,
+    existing_paths: set[str],
+    expected_model: str,
+) -> list[str]:
+    """Wait for the expected identity sockets and prove each one is ready."""
+    from sglang.srt.weight_cache.protocol import (
+        CacheConfig,
+        normalize_model_path_for_cache,
+        recv_msg,
+        send_msg,
+    )
+    from sglang.srt.weight_cache.registry import identity_for, socket_path
+
+    deadline = time.monotonic() + DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    expected_model = normalize_model_path_for_cache(expected_model)
+    while time.monotonic() < deadline:
+        if daemon_process.poll() is not None:
+            raise RuntimeError(
+                "Weight cache daemon launcher exited before readiness "
+                f"with code {daemon_process.returncode}"
+            )
+
+        ready_paths_by_rank = {}
+        for path in sorted(_cache_socket_paths() - existing_paths):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                    conn.settimeout(1.0)
+                    conn.connect(path)
+                    send_msg(conn, {"type": "ping"})
+                    if recv_msg(conn) != {"status": "ok"}:
+                        continue
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                    conn.settimeout(1.0)
+                    conn.connect(path)
+                    send_msg(conn, {"type": "query_config"})
+                    response = recv_msg(conn)
+                if response.get("status") != "ok":
+                    continue
+                config = CacheConfig.from_dict(response["config"])
+                if (
+                    config.model_path != expected_model
+                    or config.tp_size != expected_count
+                    or config.tp_rank not in range(expected_count)
+                ):
+                    continue
+                identity = identity_for(config, response["daemon"]["device_uuid"])
+                if socket_path(identity) != path:
+                    raise RuntimeError(
+                        f"Daemon reported an identity that does not own {path}"
+                    )
+                ready_paths_by_rank[config.tp_rank] = path
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+
+        if set(ready_paths_by_rank) == set(range(expected_count)):
+            return [ready_paths_by_rank[rank] for rank in range(expected_count)]
+        time.sleep(0.2)
+
+    raise TimeoutError(
+        f"Expected {expected_count} new ready weight-cache identity sockets, "
+        f"found ranks {sorted(ready_paths_by_rank)} for {expected_model}"
+    )
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2,
     "TP=2 weight cache daemon test requires >=2 GPUs (skipped on the 1-gpu runner)",
@@ -55,8 +131,10 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 2
 
-        # Step 1: Launch weight-cache daemons. The client below performs the
-        # bounded socket-ready wait after the daemons have claimed identities.
+        # Wait for the daemons' identity sockets before starting the client --
+        # client mode may take SH and disk-load before a daemon claims EX, so
+        # launching it immediately would race.
+        existing_paths = _cache_socket_paths()
         cls.daemon_process = subprocess.Popen(
             [
                 sys.executable,
@@ -68,8 +146,10 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 str(cls.tp_size),
             ]
         )
+        cls.daemon_sockets = _wait_for_daemon_sockets(
+            cls.daemon_process, cls.tp_size, existing_paths, cls.model
+        )
 
-        # Step 3: Launch server in client mode — loads weights via IPC from daemons
         cls.stdout = open(STDOUT_FILENAME, "w")
         cls.stderr = open(STDERR_FILENAME, "w")
         cls.process = popen_launch_server(
@@ -180,8 +260,9 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 1
 
-        # Step 1: Launch the weight-cache daemon. The client performs the
-        # bounded socket-ready wait below.
+        # Wait for the daemon's identity socket -- don't race the client
+        # against its own legitimate SH fallback path.
+        existing_paths = _cache_socket_paths()
         cls.daemon_process = subprocess.Popen(
             [
                 sys.executable,
@@ -193,8 +274,10 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                 str(cls.tp_size),
             ]
         )
+        cls.daemon_sockets = _wait_for_daemon_sockets(
+            cls.daemon_process, cls.tp_size, existing_paths, cls.model
+        )
 
-        # Step 3: Launch server in client mode — loads weights via IPC.
         cls.stdout = open(SMOKE_STDOUT_FILENAME, "w")
         cls.stderr = open(SMOKE_STDERR_FILENAME, "w")
         cls.process = popen_launch_server(

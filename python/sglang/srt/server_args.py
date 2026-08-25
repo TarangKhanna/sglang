@@ -3638,10 +3638,19 @@ class ServerArgs:
         Arg(
             help="Explicit Unix socket override for weight cache client mode. "
             "When unset, the client discovers an exact config/GPU match. The "
-            "override bypasses discovery and claim protection.",
+            "override bypasses socket discovery, but disk fallback still uses "
+            "the normal identity claim.",
         ),
         NS("model"),
     ] = None
+    weight_cache_timeout: A[
+        int,
+        Arg(
+            help="Maximum seconds to wait for a live weight-cache owner before "
+            "failing closed (default: 1800).",
+        ),
+        NS("model"),
+    ] = 1800
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
@@ -8200,6 +8209,9 @@ class ServerArgs:
             raise ValueError(
                 "--weight-cache-mode is not supported together with --enable-eplb."
             )
+
+        if self.weight_cache_timeout <= 0:
+            raise ValueError("--weight-cache-timeout must be greater than zero.")
 
         if self.weight_cache_mode == "daemon" and self.weight_cache_socket is not None:
             raise ValueError(

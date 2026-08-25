@@ -77,6 +77,7 @@ def _make_cache_config(**overrides) -> CacheConfig:
         resolved_revision="",
         device_capability="8.0",
         torch_version="2.5.1",
+        sglang_version="0.4.0",
         load_format="auto",
         model_loader_extra_config_hash="",
         trust_remote_code=False,
@@ -191,6 +192,7 @@ class TestCacheConfig(CustomTestCase):
             ("trust_remote_code", True),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
+            ("sglang_version", "0.3.0"),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -332,6 +334,52 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
         )
 
 
+class TestDaemonShutdownKeepsClaim(CustomTestCase):
+    def test_shutdown_does_not_release_the_lock(self):
+        """CUDA memory isn't freed just because Python drops the tensor refs,
+        so shutdown() must not release EX -- a replacement daemon could start
+        while this process still occupies the GPU."""
+        import fcntl
+        from unittest import mock
+
+        from sglang.srt.weight_cache import daemon as daemon_module
+        from sglang.srt.weight_cache.registry import IdentityLock, identity_for
+
+        server_args = SimpleNamespace(
+            model_path="/models/demo",
+            tp_size=1,
+            pp_size=1,
+            dp_size=1,
+            ep_size=1,
+            moe_dp_size=1,
+            enable_dp_attention=False,
+            enable_dp_lm_head=False,
+            attn_cp_size=1,
+            moe_dense_tp_size=1,
+            moe_a2a_backend="none",
+            deepep_mode="auto",
+            load_format="auto",
+            dtype="bfloat16",
+            quantization=None,
+            model_loader_extra_config=None,
+            trust_remote_code=False,
+            revision=None,
+        )
+        instance = daemon_module.WeightCacheDaemon(
+            server_args=server_args, gpu_id=0, tp_rank=0, pp_rank=0
+        )
+        identity = identity_for(_make_cache_config(), "GPU-shutdown-keeps-claim")
+        instance.claim_lock = IdentityLock(identity)
+        self.assertTrue(instance.claim_lock.acquire(fcntl.LOCK_EX))
+        self.addCleanup(instance.claim_lock.release)
+
+        with mock.patch.object(daemon_module.dist, "is_initialized", return_value=False):
+            instance.shutdown()
+
+        contender = IdentityLock(identity)
+        self.assertFalse(contender.acquire(fcntl.LOCK_EX))
+
+
 class TestIpcQuantAllowlist(CustomTestCase):
     def test_unquantized_is_supported(self):
         self.assertTrue(is_ipc_quant_supported("", None))
@@ -372,8 +420,8 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
     """In daemon mode the engine and daemon share a GPU, so a missing daemon
     must be a hard error — NOT a silent disk-load that would OOM the shared
     device. This exercises that contract without a GPU or a live daemon by
-    pointing the loader at an explicit socket path that does not exist (an
-    explicit socket bypasses identity discovery entirely).
+    mocking the discovery miss before the loader decides whether disk fallback
+    is permitted.
     """
 
     def _model_config(self):
@@ -391,6 +439,8 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         )
 
     def test_daemon_mode_missing_daemon_raises_instead_of_disk_load(self):
+        from unittest import mock
+
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 
@@ -405,8 +455,9 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
             fallback_load_format="auto",
         )
 
-        with self.assertRaises(RuntimeError) as ctx:
-            loader.load_model(model_config=self._model_config(), device_config=None)
+        with mock.patch.object(loader, "_fetch_from_cache", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                loader.load_model(model_config=self._model_config(), device_config=None)
         # The error must be about the missing daemon, proving we did not quietly
         # fall through to a disk load.
         self.assertIn("daemon", str(ctx.exception).lower())
@@ -439,10 +490,8 @@ class TestClaimFallbackOrWaitDaemonRace(CustomTestCase):
 
         with mock.patch.object(ipc_loader_module, "CLIENT_READY_TIMEOUT_S", 0.2):
             start = time.monotonic()
-            # Eventually gives up (no test daemon will ever appear) -- the
-            # regression is exiting *instantly* via the uncontended-lock fast
-            # path, not the eventual give-up itself. Daemon mode never falls
-            # back to disk, so the give-up is a hard error, not a return.
+            # The regression is exiting instantly via the uncontended-lock
+            # fast path -- daemon mode should wait out the bound instead.
             with self.assertRaises(RuntimeError):
                 loader._claim_fallback_or_wait(
                     identity, "/tmp/sglang-weight-cache-race-test-nonexistent.sock"
@@ -495,6 +544,25 @@ class TestClaimFallbackOrWaitDaemonRace(CustomTestCase):
         self.assertIn(identity.key, str(ctx.exception))
         self.assertIsNone(loader._fallback_claim)
 
+    def test_configured_timeout_controls_the_fail_closed_bound(self):
+        import fcntl
+
+        from sglang.srt.weight_cache.registry import IdentityLock, identity_for
+
+        identity = identity_for(_make_cache_config(), "GPU-configured-timeout")
+        holder = IdentityLock(identity)
+        self.assertTrue(holder.acquire(fcntl.LOCK_EX))
+        self.addCleanup(holder.release)
+        loader = self._loader("client")
+        loader.load_config.weight_cache_timeout = 0.2
+
+        start = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            loader._claim_fallback_or_wait(
+                identity, "/tmp/sglang-weight-cache-configured-timeout.sock"
+            )
+        self.assertGreaterEqual(time.monotonic() - start, 0.15)
+
     def test_client_mode_never_disk_loads_while_ex_blocked_past_timeout(self):
         """End-to-end through load_model(), not just _claim_fallback_or_wait:
         an exclusive holder (a live daemon, just slow) that never releases
@@ -543,6 +611,163 @@ class TestClaimFallbackOrWaitDaemonRace(CustomTestCase):
 
         loader._fallback_load.assert_not_called()
 
+    def test_explicit_socket_fallback_still_claims_the_normal_identity(self):
+        """An unavailable explicit socket is only a discovery miss, never a
+        way to bypass a live owner's EX claim and load duplicate weights."""
+        import fcntl
+        from unittest import mock
+
+        from sglang.srt.weight_cache import ipc_loader as ipc_loader_module
+        from sglang.srt.weight_cache.registry import IdentityLock, identity_for
+
+        engine_config = _make_cache_config()
+        identity = identity_for(engine_config, "GPU-explicit-ex-blocked")
+        holder = IdentityLock(identity)
+        self.assertTrue(holder.acquire(fcntl.LOCK_EX))
+        self.addCleanup(holder.release)
+
+        loader = self._loader("client")
+        loader.socket_path = "/tmp/sglang-weight-cache-explicit-missing.sock"
+        loader._build_engine_config = mock.Mock(return_value=engine_config)
+        loader._fallback_load = mock.Mock(
+            side_effect=AssertionError("fallback loader must not run")
+        )
+        device_config = SimpleNamespace(gpu_id=0)
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"], quantization_config=None
+            ),
+            quantization=None,
+        )
+
+        with mock.patch(
+            "sglang.srt.platforms.current_platform.get_device_uuid",
+            return_value="GPU-explicit-ex-blocked",
+        ), mock.patch.object(
+            ipc_loader_module, "CLIENT_READY_TIMEOUT_S", 0.2
+        ), mock.patch(
+            "sglang.srt.weight_cache.ipc_loader.check_ipc_quant_support"
+        ):
+            with self.assertRaises(RuntimeError):
+                loader.load_model(
+                    model_config=model_config, device_config=device_config
+                )
+
+        loader._fallback_load.assert_not_called()
+
+    def test_communication_failure_falls_back_only_after_ex_is_released(self):
+        """A dead producer may release EX, after which client mode can safely
+        take SH and disk-load. A live producer would instead hold EX until the
+        configured deadline and fail closed."""
+        import fcntl
+        import socket as socket_mod
+        import tempfile
+        import threading
+        from unittest import mock
+
+        from sglang.srt.weight_cache.protocol import recv_msg
+        from sglang.srt.weight_cache.registry import (
+            IdentityLock,
+            identity_for,
+            socket_path,
+        )
+
+        engine_config = _make_cache_config()
+        identity = identity_for(engine_config, "GPU-communication-fallback")
+        with tempfile.TemporaryDirectory(
+            dir="/tmp", prefix="wc-"
+        ) as runtime_dir, mock.patch(
+            "sglang.srt.weight_cache.registry._RUNTIME_DIR", runtime_dir
+        ):
+            holder = IdentityLock(identity)
+            self.assertTrue(holder.acquire(fcntl.LOCK_EX))
+            self.addCleanup(holder.release)
+            listener_path = socket_path(identity)
+            listener = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            listener.bind(listener_path)
+            listener.listen(1)
+            self.addCleanup(listener.close)
+
+            def _drop_owner_after_request():
+                conn, _ = listener.accept()
+                try:
+                    recv_msg(conn)
+                finally:
+                    conn.close()
+                    holder.release()
+
+            server = threading.Thread(target=_drop_owner_after_request, daemon=True)
+            server.start()
+            self.addCleanup(server.join, 1.0)
+
+            loader = self._loader("client")
+            loader._build_engine_config = mock.Mock(return_value=engine_config)
+            with mock.patch(
+                "sglang.srt.platforms.current_platform.get_device_uuid",
+                return_value="GPU-communication-fallback",
+            ):
+                result = loader._fetch_from_cache(
+                    model_config=SimpleNamespace(),
+                    device_config=SimpleNamespace(gpu_id=0),
+                )
+
+        self.assertIsNone(result)
+        self.assertIsNotNone(loader._fallback_claim)
+
+    def test_explicit_socket_config_mismatch_fails_instead_of_disk_loading(self):
+        """An explicit discovery override may point at the wrong live daemon,
+        but that is a configuration error, not evidence the owner died and
+        released EX. Preserve the mismatch instead of silently disk-loading."""
+        import socket as socket_mod
+        import tempfile
+        import threading
+        from unittest import mock
+
+        engine_config = _make_cache_config()
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="wc-") as runtime_dir:
+            listener_path = os.path.join(runtime_dir, "wrong-daemon.sock")
+            listener = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            listener.bind(listener_path)
+            listener.listen(1)
+            self.addCleanup(listener.close)
+
+            def _reply_with_mismatch():
+                conn, _ = listener.accept()
+                try:
+                    recv_msg(conn)
+                    send_msg(conn, {"status": "mismatch", "daemon_config": {}})
+                finally:
+                    conn.close()
+
+            server = threading.Thread(target=_reply_with_mismatch, daemon=True)
+            server.start()
+            self.addCleanup(server.join, 1.0)
+
+            loader = self._loader("client")
+            loader.socket_path = listener_path
+            loader._build_engine_config = mock.Mock(return_value=engine_config)
+            loader._fallback_load = mock.Mock(
+                side_effect=AssertionError("config mismatch must not disk load")
+            )
+            model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"], quantization_config=None
+                ),
+                quantization=None,
+            )
+
+            with mock.patch(
+                "sglang.srt.platforms.current_platform.get_device_uuid",
+                return_value="GPU-explicit-config-mismatch",
+            ), mock.patch("sglang.srt.weight_cache.ipc_loader.check_ipc_quant_support"):
+                with self.assertRaisesRegex(RuntimeError, "Daemon config mismatch"):
+                    loader.load_model(
+                        model_config=model_config,
+                        device_config=SimpleNamespace(gpu_id=0),
+                    )
+
+        loader._fallback_load.assert_not_called()
+
     def test_daemon_mode_attaches_once_the_socket_appears_mid_wait(self):
         """The positive path this whole class exists to protect: a
         co-terminal daemon that's merely slow to claim still lets the
@@ -580,6 +805,50 @@ class TestClaimFallbackOrWaitDaemonRace(CustomTestCase):
 
         self.assertFalse(result)
         self.assertLess(elapsed, 2.0)
+
+
+class TestIpcWatchdogLifetime(CustomTestCase):
+    def test_failed_tensor_import_does_not_start_a_watchdog(self):
+        from unittest import mock
+
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.configs.model_config import ModelImpl
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        loader = IpcModelLoader(
+            load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
+            socket_path=None,
+            weight_cache_mode="client",
+            fallback_load_format="auto",
+        )
+        loader._fetch_from_cache = mock.Mock(
+            return_value={
+                "daemon": {"pid": 123, "process_start_time": 1.0},
+                "entries": {},
+            }
+        )
+        loader._load_zero_copy_mode = mock.Mock(
+            side_effect=RuntimeError("import failed")
+        )
+        loader._start_daemon_liveness_watchdog = mock.Mock()
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"], quantization_config=None
+            ),
+            quantization=None,
+            model_impl=ModelImpl.AUTO,
+        )
+
+        with mock.patch(
+            "sglang.srt.weight_cache.ipc_loader.check_ipc_quant_support"
+        ), mock.patch(
+            "sglang.srt.weight_cache.ipc_loader.process_identity_is_alive",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "import failed"):
+                loader.load_model(model_config=model_config, device_config=None)
+
+        loader._start_daemon_liveness_watchdog.assert_not_called()
 
 
 class TestFallbackClaimSurvivesDiskLoad(CustomTestCase):
@@ -637,10 +906,8 @@ class TestFallbackClaimSurvivesDiskLoad(CustomTestCase):
         self.assertIs(loader._fallback_claim, claim)
         self.assertIsNotNone(claim.fd)
 
-        # The invariant this test exists for: a daemon for this same
-        # identity must not be able to acquire EX while these disk-loaded
-        # weights remain resident, or it would load a duplicate copy onto
-        # the same GPU.
+        # A daemon must not be able to claim EX while these weights stay
+        # resident, or it would load a duplicate copy onto the same GPU.
         import fcntl
 
         from sglang.srt.weight_cache.registry import IdentityLock

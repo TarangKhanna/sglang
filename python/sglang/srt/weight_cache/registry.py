@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import time
+import weakref
 
 import msgspec
 import psutil
@@ -16,11 +17,21 @@ import psutil
 from .protocol import CacheConfig
 
 UNIX_SOCKET_PATH_MAX_BYTES = 107
-# A daemon may wait behind an engine's full disk load before it can own the
-# identity. The shorter client bound preserves an availability escape hatch.
+# Legacy defaults for direct loader construction. ServerArgs supplies the
+# public --weight-cache-timeout bound in normal daemon and client launches.
 DAEMON_CLAIM_TIMEOUT_S = 20 * 60
 CLIENT_READY_TIMEOUT_S = 10 * 60
 _RUNTIME_DIR = f"/tmp/sglang-weight-cache-{os.getuid()}"
+_ACTIVE_LOCKS: weakref.WeakSet = weakref.WeakSet()
+
+
+def _close_inherited_identity_locks() -> None:
+    """Drop every inherited lock fd in a forked child exactly once."""
+    for claim in list(_ACTIVE_LOCKS):
+        claim._close_after_fork()
+
+
+os.register_at_fork(after_in_child=_close_inherited_identity_locks)
 
 
 def default_runtime_dir() -> str:
@@ -102,24 +113,38 @@ class IdentityLock:
         self.fd: int | None = None
         self.mode: int | None = None
 
+    def __del__(self) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+
     def acquire(self, mode: int, timeout: float = 0.0) -> bool:
+        if self.fd is not None:
+            raise RuntimeError("weight cache identity lock is already acquired")
         fd = os.open(lock_path(self.identity), os.O_CREAT | os.O_RDWR, 0o600)
         os.set_inheritable(fd, False)
         deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(fd, mode | fcntl.LOCK_NB)
-                self.fd = fd
-                self.mode = mode
-                # CLOEXEC protects today's Popen/spawn path. A plain future
-                # fork shares this open-file description, so close in its child.
-                os.register_at_fork(after_in_child=self._close_after_fork)
-                return True
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    os.close(fd)
-                    return False
-                time.sleep(0.05)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    self.fd = fd
+                    self.mode = mode
+                    # CLOEXEC protects today's Popen/spawn path. The module-level
+                    # fork hook closes this fd in a plain-fork child without retaining
+                    # one callback per successful acquisition.
+                    _ACTIVE_LOCKS.add(self)
+                    return True
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(fd)
+                        return False
+                    time.sleep(0.05)
+        except BaseException:
+            os.close(fd)
+            raise
 
     def release(self) -> None:
         if self.fd is not None:
@@ -127,6 +152,7 @@ class IdentityLock:
             os.close(self.fd)
             self.fd = None
             self.mode = None
+            _ACTIVE_LOCKS.discard(self)
 
     def _close_after_fork(self) -> None:
         """Drop the inherited fd without unlocking the parent's claim."""
@@ -134,6 +160,7 @@ class IdentityLock:
             os.close(self.fd)
             self.fd = None
             self.mode = None
+            _ACTIVE_LOCKS.discard(self)
 
 
 def unlink_socket_for_owner(path: str, claim: IdentityLock) -> None:

@@ -232,6 +232,7 @@ def build_load_config(
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
         weight_cache_trust_remote_code=server_args.trust_remote_code,
+        weight_cache_timeout=server_args.weight_cache_timeout,
     )
 
 

@@ -1786,7 +1786,7 @@ def _wait_for_scheduler_ready(
 
 
 def _wait_for_ready_watching_daemons(
-    scheduler_init_result: "SchedulerInitResult",
+    scheduler_init_result: SchedulerInitResult,
     weight_cache_daemon_procs: Optional[List],
 ) -> None:
     """Call scheduler_init_result.wait_for_ready(), and if any engine-owned
