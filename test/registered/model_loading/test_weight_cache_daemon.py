@@ -1,7 +1,6 @@
 import os
 import subprocess
 import sys
-import time
 import unittest
 
 import requests
@@ -48,7 +47,7 @@ PROMPTS = [
     "TP=2 weight cache daemon test requires >=2 GPUs (skipped on the 1-gpu runner)",
 )
 class TestWeightCacheDaemonTP2(CustomTestCase):
-    """E2E test: start weight cache daemons, then launch server in client mode with TP2."""
+    """Start cache daemons, then launch a TP=2 server in client mode."""
 
     @classmethod
     def setUpClass(cls):
@@ -56,15 +55,8 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 2
 
-        # Clean up stale ready/socket files from previous runs
-        for rank in range(cls.tp_size):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    os.unlink(path)
-
-        # Step 1: Launch weight cache daemons (blocks until all ranks are ready,
-        # then monitors child processes)
+        # Step 1: Launch weight-cache daemons. The client below performs the
+        # bounded socket-ready wait after the daemons have claimed identities.
         cls.daemon_process = subprocess.Popen(
             [
                 sys.executable,
@@ -76,24 +68,6 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 str(cls.tp_size),
             ]
         )
-
-        # Step 2: Wait for all daemon ready files
-        timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        start = time.time()
-        for rank in range(cls.tp_size):
-            ready_path = f"/tmp/sglang_weight_cache_rank{rank}.ready"
-            while not os.path.exists(ready_path):
-                if time.time() - start > timeout:
-                    kill_process_tree(cls.daemon_process.pid)
-                    raise TimeoutError(
-                        f"Weight cache daemon rank {rank} not ready within {timeout}s"
-                    )
-                if cls.daemon_process.poll() is not None:
-                    raise RuntimeError(
-                        f"Weight cache daemon exited prematurely "
-                        f"with code {cls.daemon_process.returncode}"
-                    )
-                time.sleep(2)
 
         # Step 3: Launch server in client mode — loads weights via IPC from daemons
         cls.stdout = open(STDOUT_FILENAME, "w")
@@ -129,14 +103,6 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for rank in range(getattr(cls, "tp_size", 2)):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
 
     def test_generate(self):
         for prompt in PROMPTS:
@@ -214,15 +180,8 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 1
 
-        # Clean up stale ready/socket files from previous runs.
-        for rank in range(cls.tp_size):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    os.unlink(path)
-
-        # Step 1: Launch the weight cache daemon (blocks until the rank is
-        # ready, then monitors the child process).
+        # Step 1: Launch the weight-cache daemon. The client performs the
+        # bounded socket-ready wait below.
         cls.daemon_process = subprocess.Popen(
             [
                 sys.executable,
@@ -234,24 +193,6 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                 str(cls.tp_size),
             ]
         )
-
-        # Step 2: Wait for the daemon ready file.
-        timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        start = time.time()
-        for rank in range(cls.tp_size):
-            ready_path = f"/tmp/sglang_weight_cache_rank{rank}.ready"
-            while not os.path.exists(ready_path):
-                if time.time() - start > timeout:
-                    kill_process_tree(cls.daemon_process.pid)
-                    raise TimeoutError(
-                        f"Weight cache daemon rank {rank} not ready within {timeout}s"
-                    )
-                if cls.daemon_process.poll() is not None:
-                    raise RuntimeError(
-                        f"Weight cache daemon exited prematurely "
-                        f"with code {cls.daemon_process.returncode}"
-                    )
-                time.sleep(2)
 
         # Step 3: Launch server in client mode — loads weights via IPC.
         cls.stdout = open(SMOKE_STDOUT_FILENAME, "w")
@@ -287,14 +228,6 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for rank in range(getattr(cls, "tp_size", 1)):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
 
     def test_generate(self):
         resp = requests.post(

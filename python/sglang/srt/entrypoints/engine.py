@@ -142,6 +142,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
 
+# Cadence for _wait_for_ready_watching_daemons' daemon-liveness poll, matched
+# to _wait_for_scheduler_ready's own poll(timeout=5.0) for a dead scheduler.
+_DAEMON_LIVENESS_WATCH_INTERVAL_S = 5.0
+
 
 @dataclasses.dataclass
 class SchedulerInitResult:
@@ -269,21 +273,29 @@ class Engine(EngineScoreMixin, EngineBase):
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
-        # Launch subprocesses
-        (
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result,
-            subprocess_watchdog,
-            weight_cache_daemon_procs,
-        ) = self._launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=self.init_tokenizer_manager_func,
-            run_scheduler_process_func=self.run_scheduler_process_func,
-            run_detokenizer_process_func=self.run_detokenizer_process_func,
-            placement_group=self._placement_group,
-        )
+        # Filled in as soon as daemons spawn, so a later failure in
+        # _launch_subprocesses can still terminate them.
+        weight_cache_daemon_procs_holder: List = []
+        try:
+            (
+                tokenizer_manager,
+                template_manager,
+                port_args,
+                scheduler_init_result,
+                subprocess_watchdog,
+                weight_cache_daemon_procs,
+            ) = self._launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=self.init_tokenizer_manager_func,
+                run_scheduler_process_func=self.run_scheduler_process_func,
+                run_detokenizer_process_func=self.run_detokenizer_process_func,
+                placement_group=self._placement_group,
+                weight_cache_daemon_procs_out=weight_cache_daemon_procs_holder,
+            )
+        except BaseException:
+            if weight_cache_daemon_procs_holder:
+                self._terminate_weight_cache_daemons(weight_cache_daemon_procs_holder)
+            raise
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
@@ -711,20 +723,8 @@ class Engine(EngineScoreMixin, EngineBase):
             f"dist_init_method={dist_init_method}"
         )
 
-        # Validate and clean up stale .ready/.sock files from prior runs.
-        # If a daemon is still alive at this rank, raise instead of clobbering.
         from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
-        from sglang.srt.weight_cache.protocol import (
-            cleanup_stale_daemon_files,
-            compute_global_rank,
-            compute_local_gpu_id,
-            get_ready_path,
-        )
-
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
-                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                cleanup_stale_daemon_files(global_rank)
+        from sglang.srt.weight_cache.protocol import compute_local_gpu_id
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -743,47 +743,13 @@ class Engine(EngineScoreMixin, EngineBase):
                     pp_rank=pp_rank,
                     dist_init_method=dist_init_method,
                 )
-
                 daemon_procs.append(proc)
 
-        # Wait for all daemons to be ready (ready file exists). On any failure
-        # (readiness timeout or a daemon exiting early) terminate the siblings
-        # we already spawned before propagating, so a partial launch does not
-        # leak GPU-resident daemons.
-        timeout = server_args.weight_cache_timeout
-        check_interval = 2
-        start_time = time.time()
-        try:
-            for pp_rank in pp_rank_range:
-                for tp_rank in tp_rank_range:
-                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                    ready_path = get_ready_path(global_rank)
-                    while not os.path.exists(ready_path):
-                        time.sleep(check_interval)
-                        if time.time() - start_time > timeout:
-                            raise TimeoutError(
-                                f"Weight cache daemon for pp_rank={pp_rank} "
-                                f"tp_rank={tp_rank} did not become ready "
-                                f"within {timeout}s"
-                            )
-                        # Check if daemon process is still alive
-                        for p in daemon_procs:
-                            if not p.is_alive():
-                                raise RuntimeError(
-                                    f"Weight cache daemon (pid={p.pid}) exited prematurely "
-                                    f"with code {p.exitcode}"
-                                )
-                    logger.info(
-                        f"Weight cache daemon for pp_rank={pp_rank} "
-                        f"tp_rank={tp_rank} is ready"
-                    )
-        except BaseException:
-            cls._terminate_weight_cache_daemons(daemon_procs)
-            raise
-
+        # Failure detection lives in the client's bounded wait and
+        # _wait_for_ready_watching_daemons below, not here.
         logger.info(
-            f"All {num_daemons} weight cache daemons on node "
-            f"{server_args.node_rank} are ready"
+            f"Launched {num_daemons} weight cache daemons on node "
+            f"{server_args.node_rank}; clients wait for socket readiness"
         )
         return daemon_procs
 
@@ -791,12 +757,12 @@ class Engine(EngineScoreMixin, EngineBase):
     def _terminate_weight_cache_daemons(procs, timeout: float = 10.0):
         """Gracefully stop engine-spawned weight cache daemons.
 
-        Send SIGTERM first so each daemon's signal handler can unlink its
-        ``.sock``/``.ready`` files, then SIGKILL any straggler. This matters
+        Send SIGTERM first so each daemon's signal handler can release its
+        socket and identity claim, then SIGKILL any straggler. This matters
         because ``shutdown()`` otherwise reaps children via
-        ``kill_process_tree`` (SIGKILL), which would skip that cleanup and
-        leave stale files that make the next client-mode boot fail with a
-        confusing "socket exists but connection refused" instead of a clean
+        ``kill_process_tree`` (SIGKILL), which would skip graceful cleanup
+        and leave a held claim that makes the next client-mode boot fail with
+        a confusing "socket exists but connection refused" instead of a clean
         "no daemon" path.
         """
         if not procs:
@@ -1027,6 +993,7 @@ class Engine(EngineScoreMixin, EngineBase):
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
         placement_group=None,
+        weight_cache_daemon_procs_out: Optional[List] = None,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1035,6 +1002,14 @@ class Engine(EngineScoreMixin, EngineBase):
         Optional[SubprocessWatchdog],
     ]:
         """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+
+        Args:
+            weight_cache_daemon_procs_out: if given, populated with any
+                spawned weight-cache daemon procs as soon as they exist --
+                before this function returns. Lets the caller reach and
+                terminate them if a later step here raises, since the
+                normal return value carrying them is unavailable on that
+                path.
 
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog, weight_cache_daemon_procs).
@@ -1105,6 +1080,8 @@ class Engine(EngineScoreMixin, EngineBase):
                 weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
                     server_args
                 )
+                if weight_cache_daemon_procs_out is not None:
+                    weight_cache_daemon_procs_out.extend(weight_cache_daemon_procs)
         except BaseException:
             restore_context(context_before_publish)
             raise
@@ -1130,7 +1107,9 @@ class Engine(EngineScoreMixin, EngineBase):
 
         if server_args.node_rank >= 1:
             # Non-zero-rank nodes do not run tokenizer processes.
-            scheduler_init_result.wait_for_ready()
+            _wait_for_ready_watching_daemons(
+                scheduler_init_result, weight_cache_daemon_procs
+            )
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
@@ -1162,7 +1141,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # not start the Python detokenizer subprocess(es) or tokenizer manager.
         # Do not use RayEngine with the Rust server, as it is not supported.
         if envs.SGLANG_RUST_SERVER.get():
-            scheduler_init_result.wait_for_ready()
+            _wait_for_ready_watching_daemons(
+                scheduler_init_result, weight_cache_daemon_procs
+            )
             # Set up subprocess liveness watchdog to detect crashes
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
@@ -1203,7 +1184,9 @@ class Engine(EngineScoreMixin, EngineBase):
         startup_complete = False
         try:
             # Wait for the model to finish loading
-            scheduler_init_result.wait_for_ready()
+            _wait_for_ready_watching_daemons(
+                scheduler_init_result, weight_cache_daemon_procs
+            )
 
             cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 
@@ -1800,6 +1783,57 @@ def _wait_for_scheduler_ready(
                     raise _scheduler_died_error(j, scheduler_procs[j])
 
     return scheduler_infos
+
+
+def _wait_for_ready_watching_daemons(
+    scheduler_init_result: "SchedulerInitResult",
+    weight_cache_daemon_procs: Optional[List],
+) -> None:
+    """Call scheduler_init_result.wait_for_ready(), and if any engine-owned
+    weight-cache daemon dies first, raise promptly instead of only finding
+    out once the scheduler's own, much longer, internal wait eventually
+    times out.
+
+    Composed entirely at this call site rather than by threading daemon
+    knowledge into wait_for_ready/_launch_scheduler_processes, which are
+    override points -- a subclass (e.g. RayEngine) overriding those has no
+    reason to know about weight-cache daemons, and making it responsible for
+    that anyway is exactly the kind of contract change that broke silently
+    for one such override before this function existed.
+
+    The wait always runs to completion or raises on its own; when a daemon
+    dies first, this raises without waiting for it and abandons it on a
+    daemon=True thread (never explicitly joined) rather than block on
+    something that may itself be stuck for minutes.
+    """
+    if not weight_cache_daemon_procs:
+        scheduler_init_result.wait_for_ready()
+        return
+
+    outcome: Dict[str, BaseException] = {}
+
+    def _run():
+        try:
+            scheduler_init_result.wait_for_ready()
+        except BaseException as e:
+            outcome["error"] = e
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        thread.join(timeout=_DAEMON_LIVENESS_WATCH_INTERVAL_S)
+        if thread.is_alive():
+            dead = next(
+                (p for p in weight_cache_daemon_procs if not p.is_alive()), None
+            )
+            if dead is not None:
+                raise RuntimeError(
+                    f"Weight cache daemon (pid={dead.pid}) exited "
+                    f"prematurely with code {dead.exitcode} while waiting "
+                    f"for scheduler readiness"
+                )
+    if "error" in outcome:
+        raise outcome["error"]
 
 
 def _calculate_rank_ranges(

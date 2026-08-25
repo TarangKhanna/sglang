@@ -3636,18 +3636,12 @@ class ServerArgs:
     weight_cache_socket: A[
         Optional[str],
         Arg(
-            help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            help="Explicit Unix socket override for weight cache client mode. "
+            "When unset, the client discovers an exact config/GPU match. The "
+            "override bypasses discovery and claim protection.",
         ),
         NS("model"),
     ] = None
-    weight_cache_timeout: A[
-        int,
-        Arg(
-            help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
-        ),
-        NS("model"),
-    ] = 1800
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
@@ -8205,6 +8199,12 @@ class ServerArgs:
         if self.weight_cache_mode != "off" and self.enable_eplb:
             raise ValueError(
                 "--weight-cache-mode is not supported together with --enable-eplb."
+            )
+
+        if self.weight_cache_mode == "daemon" and self.weight_cache_socket is not None:
+            raise ValueError(
+                "--weight-cache-socket is an explicit client-mode override and "
+                "cannot be combined with --weight-cache-mode daemon"
             )
 
     def _is_mistral_native_format(self) -> bool:

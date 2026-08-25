@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weight Cache Daemon — a persistent process that holds post-quantized,
-TP-sharded model weights in GPU memory and serves them via pluggable transport backends.
+TP-sharded model weights in GPU memory and serves them via CUDA IPC handles.
 
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
 2. Exports every parameter/buffer as a CUDA IPC handle
-3. Serves transport entries over a Unix socket to requesting engine processes
+3. Serves handles over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
 
 Usage:
@@ -36,14 +36,16 @@ Usage:
 
 import argparse
 import dataclasses
+import fcntl
 import logging
 import multiprocessing
 import os
 import signal
 import socket
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import psutil
 import torch
 import torch.distributed as dist
 
@@ -54,16 +56,25 @@ from sglang.srt.runtime_context import get_parallel, publish
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
-    cleanup_stale_daemon_files,
     compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
     get_quant_method_name,
-    get_ready_path,
-    get_socket_path,
+    get_resolved_model_revision,
+    hash_loader_extra_config,
     hash_quant_config,
+    normalize_model_path_for_cache,
     recv_msg,
     send_msg,
+)
+from .registry import (
+    DAEMON_CLAIM_TIMEOUT_S,
+    CacheIdentity,
+    IdentityLock,
+    identity_for,
+    lock_holder_diagnostics,
+    socket_path,
+    unlink_socket_for_owner,
 )
 from .transport import choose_daemon_transport_backend
 
@@ -84,18 +95,14 @@ class WeightCacheDaemonArgs:
     """Daemon-private worker identity and standalone launcher controls.
 
     ``gpu_id``, ``tp_rank``, ``pp_rank``, and ``dist_init_method`` identify a
-    worker after the shared server configuration has been resolved. ``timeout``
-    and ``force`` apply only when this entrypoint launches and monitors a local
-    daemon group. None has a corresponding ServerArgs field with these
-    per-worker semantics.
+    worker after the shared server configuration has been resolved. None has
+    a corresponding ServerArgs field with these per-worker semantics.
     """
 
     gpu_id: Optional[int] = None
     tp_rank: Optional[int] = None
     pp_rank: int = 0
     dist_init_method: Optional[str] = None
-    timeout: int = 1800
-    force: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -117,8 +124,6 @@ class WeightCacheDaemonArgs:
             default=None,
             help="Daemon distributed init method (for example tcp://host:29500).",
         )
-        parser.add_argument("--timeout", type=int, default=1800)
-        parser.add_argument("--force", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "WeightCacheDaemonArgs":
@@ -127,8 +132,6 @@ class WeightCacheDaemonArgs:
             tp_rank=args.tp_rank,
             pp_rank=args.pp_rank,
             dist_init_method=args.dist_init_method,
-            timeout=args.timeout,
-            force=args.force,
         )
 
 
@@ -162,6 +165,11 @@ class WeightCacheDaemon:
         self.attn_cp_size = server_args.attn_cp_size
         self.moe_dense_tp_size = server_args.moe_dense_tp_size
         self.moe_a2a_backend = server_args.moe_a2a_backend
+        # Snapshotted for the resolved-startup-layout record like the fields
+        # above, but deliberately not part of CacheConfig/the identity
+        # fingerprint: deepep_mode only selects a runtime MoE token-dispatch
+        # path (token_dispatcher/deepep.py) and never touches exported
+        # tensor values, so a mismatch can't produce wrong-numerics weights.
         self.deepep_mode = server_args.deepep_mode
         self.load_format = server_args.load_format
         self.dtype = server_args.dtype
@@ -171,18 +179,17 @@ class WeightCacheDaemon:
         self.revision = server_args.revision
         self.dist_init_method = dist_init_method
 
-        self.socket_path = get_socket_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
-        self.ready_path = get_ready_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
+        self.identity: Optional[CacheIdentity] = None
+        self.claim_lock: Optional[IdentityLock] = None
+        self.device_uuid: Optional[str] = None
+        self.socket_path: Optional[str] = None
 
         self.model = None
         self.config: Optional[CacheConfig] = None
-        # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
+        # name -> transport-specific tensor entry metadata.
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.transport_backend = None
+        self._gpu_work_started = False
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -203,9 +210,6 @@ class WeightCacheDaemon:
                 f"Distributed already initialized, skipping"
             )
             return
-
-        # Initialize distributed environment
-        import torch.distributed as dist
 
         if not dist.is_initialized():
             if self.dist_init_method is None:
@@ -267,6 +271,7 @@ class WeightCacheDaemon:
         # message before touching the device.
         self._assert_ipc_compatible_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
+        self._gpu_work_started = True
 
         # Reduce thread contention during multi-process loading
         torch.set_num_threads(1)
@@ -277,6 +282,12 @@ class WeightCacheDaemon:
         from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
+        # ServerArgs resolves source-specific "auto" values (for example
+        # mistral, remote, or runai_streamer). The daemon must fingerprint and
+        # load with that exact resolved value or every client will mismatch.
+        self.load_format = str(
+            getattr(server_args.load_format, "value", server_args.load_format)
+        )
         publish(server_args, role="weight_cache_daemon")
 
         from sglang.srt.layers.moe import initialize_moe_config
@@ -294,7 +305,7 @@ class WeightCacheDaemon:
             quantization=self.quantization,
         )
 
-        # Build cache config fingerprint before loading the model.
+        # Build cache config fingerprint BEFORE loading the model.
         # Loading may mutate hf_config.quantization_config (e.g. via
         # process_weights_after_loading), which would produce a different
         # hash than what the engine computes from the original config.
@@ -307,17 +318,22 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
-        # Refuse unsupported quant methods before creating distributed groups
-        # or touching model weights.
+        # Give unsupported methods the actionable allowlist error before
+        # attempting to serialize vendor-specific quantization objects.
         check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
-        # The initialized groups are the authority for rank identity. This
-        # avoids maintaining a second copy of the model-parallel hierarchy.
+        # moe_dp_rank/moe_ep_rank are only known after this rank joins its MoE
+        # process groups, so the identity claim waits until after this call --
+        # still well before load_model(), the expensive step it protects.
+        # Two launches reusing the same rendezvous address is a caller
+        # configuration error, same as for any other distributed launch in
+        # this codebase -- distinct launches must use distinct endpoints.
         self._init_distributed(server_args, model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
+
         self.config = CacheConfig(
-            model_path=self.model_path,
+            model_path=normalize_model_path_for_cache(self.model_path),
             model_arch=(
                 model_config.hf_config.architectures[0]
                 if model_config.hf_config.architectures
@@ -341,8 +357,30 @@ class WeightCacheDaemon:
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
-            **compute_env_stamp(),
+            resolved_revision=get_resolved_model_revision(model_config),
+            load_format=self.load_format,
+            model_loader_extra_config_hash=hash_loader_extra_config(
+                self.model_loader_extra_config
+            ),
+            trust_remote_code=self.trust_remote_code,
+            **compute_env_stamp(self.gpu_id),
         )
+
+        # Reserve this exact identity before the expensive disk load. A stale
+        # daemon for a different fingerprint has a different lock and cannot
+        # block us.
+        self.device_uuid = current_platform.get_device_uuid(self.gpu_id)
+        identity = identity_for(self.config, self.device_uuid)
+        listener_path = socket_path(identity)
+        claim_lock = IdentityLock(identity)
+        if not claim_lock.acquire(fcntl.LOCK_EX, DAEMON_CLAIM_TIMEOUT_S):
+            raise RuntimeError(
+                "timed out waiting for weight-cache claim "
+                f"{identity.key}: {lock_holder_diagnostics(identity)}"
+            )
+        self.identity = identity
+        self.claim_lock = claim_lock
+        self.socket_path = listener_path
 
         # Build load config
         load_config = LoadConfig(
@@ -357,7 +395,7 @@ class WeightCacheDaemon:
         )
         tic = time.perf_counter()
 
-        # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
+        # DefaultModelLoader includes TP sharding and quant post-processing.
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         self.model = loader.load_model(
             model_config=model_config,
@@ -411,7 +449,12 @@ class WeightCacheDaemon:
                     )
 
     def _export_state(self):
-        """Export model state entries through the selected transport backend."""
+        """Export model parameters and buffers as CUDA IPC handles.
+
+        This includes both persistent buffers (in state_dict) and non-persistent
+        buffers (e.g. rotary embedding cos_sin_cache) so the engine can fully
+        reconstruct the model state via zero-copy IPC.
+        """
         self.state_entries.clear()
 
         # remove_duplicate=False so tied weights are recognized as parameters
@@ -422,8 +465,8 @@ class WeightCacheDaemon:
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
         state_dict_names = set(self.model.state_dict().keys())
-        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {}
 
+        state_tensors = {}
         # Export all items from state_dict (parameters + persistent buffers)
         for name, tensor in self.model.state_dict().items():
             state_tensors[name] = (tensor.data, name in param_names)
@@ -452,45 +495,43 @@ class WeightCacheDaemon:
             f"Exported {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
             f"transport={self.transport_backend.name}, "
-            f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+            f"serialized handle size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
     def serve(self):
         """Block and serve IPC handles over Unix socket."""
-        # Do NOT unlink an existing socket here: stale-file cleanup is the launch
-        # path's job (cleanup_stale_daemon_files refuses to remove a socket whose
-        # .ready still points at a live PID). A leftover live socket makes bind()
-        # fail loudly instead of silently stealing another daemon's socket.
+        if self.identity is None or self.config is None or self.socket_path is None:
+            raise RuntimeError("weight cache daemon must load and claim before serve")
+        # We hold LOCK_EX, so no other daemon can own this identity's path.
+        # Only the owner unlinks a stale socket; clients never do.
+        unlink_socket_for_owner(self.socket_path, self.claim_lock)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old_umask = os.umask(0o177)
         try:
-            sock.bind(self.socket_path)
-        finally:
-            os.umask(old_umask)
-        sock.listen(8)
-        sock.settimeout(1.0)  # Allow periodic shutdown check
+            old_umask = os.umask(0o177)
+            try:
+                sock.bind(self.socket_path)
+            finally:
+                os.umask(old_umask)
+            sock.listen(8)
+            sock.settimeout(1.0)  # Allow periodic shutdown check
+            # bind+listen is the readiness signal; there is no record to publish.
 
-        # Write ready file
-        with open(self.ready_path, "w") as f:
-            f.write(f"pid={os.getpid()}\n")
-            f.write(f"config={self.config.to_dict()}\n")
-
-        logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id}] " f"Listening on {self.socket_path}"
-        )
-
-        self._running = True
-
-        def _signal_handler(signum, frame):
             logger.info(
-                f"[WeightCacheDaemon gpu={self.gpu_id}] Received signal {signum}, shutting down"
+                f"[WeightCacheDaemon gpu={self.gpu_id}] Listening on {self.socket_path}"
             )
-            self._running = False
 
-        signal.signal(signal.SIGTERM, _signal_handler)
-        signal.signal(signal.SIGINT, _signal_handler)
+            self._running = True
 
-        try:
+            def _signal_handler(signum, frame):
+                logger.info(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] Received signal "
+                    f"{signum}, shutting down"
+                )
+                self._running = False
+
+            signal.signal(signal.SIGTERM, _signal_handler)
+            signal.signal(signal.SIGINT, _signal_handler)
+
             while self._running:
                 try:
                     conn, _ = sock.accept()
@@ -514,11 +555,21 @@ class WeightCacheDaemon:
                     continue
         finally:
             sock.close()
-            if os.path.exists(self.socket_path):
-                os.unlink(self.socket_path)
-            if os.path.exists(self.ready_path):
-                os.unlink(self.ready_path)
-            logger.info(f"[WeightCacheDaemon gpu={self.gpu_id}] Shutdown complete")
+            unlink_socket_for_owner(self.socket_path, self.claim_lock)
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                "Stopped accepting connections"
+            )
+
+    def _daemon_metadata(self) -> Dict[str, Any]:
+        if self.identity is None:
+            raise RuntimeError("weight cache daemon identity is unavailable")
+        return {
+            "device_uuid": self.identity.device_uuid,
+            "config_fingerprint": self.identity.config_fingerprint,
+            "pid": os.getpid(),
+            "process_start_time": float(psutil.Process().create_time()),
+        }
 
     def _handle_connection(self, conn: socket.socket):
         """Handle a single client connection."""
@@ -526,7 +577,14 @@ class WeightCacheDaemon:
 
         if req.get("type") == "query_config":
             # Client asks for config without requesting handles
-            send_msg(conn, {"status": "ok", "config": self.config.to_dict()})
+            send_msg(
+                conn,
+                {
+                    "status": "ok",
+                    "config": self.config.to_dict(),
+                    "daemon": self._daemon_metadata(),
+                },
+            )
 
         elif req.get("type") == "fetch_state":
             # Client requests full state with IPC handles
@@ -551,17 +609,14 @@ class WeightCacheDaemon:
 
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                f"Serving {len(self.state_entries)} tensors via "
+                f"Serving {len(self.state_entries)} entries via "
                 f"{self.transport_backend.name} transport"
             )
             self.transport_backend.send_fetch_state_response(
                 conn,
                 config=self.config.to_dict(),
                 entries=self.state_entries,
-                # PID so the client can watch daemon liveness: if this
-                # process dies while clients hold IPC mappings, their
-                # param.data (and any CUDA-graph-captured addresses) dangle.
-                pid=os.getpid(),
+                daemon=self._daemon_metadata(),
             )
 
         elif req.get("type") == "ping":
@@ -577,15 +632,16 @@ class WeightCacheDaemon:
             )
 
     def shutdown(self):
-        """Release GPU memory and clean up."""
+        """Stop serving and leave exported tensors alive until process exit."""
+        self._running = False
         if dist.is_initialized():
             dist.destroy_process_group()
-        if self.model is not None:
-            del self.model
-            self.model = None
         self.state_entries.clear()
-        current_platform.empty_cache()
-        self._running = False
+        self.model = None
+        # Releasing EX is the public signal that this identity's weight state
+        # is gone; doing so before clearing tensors permits double residency.
+        if self.claim_lock is not None:
+            self.claim_lock.release()
 
 
 def run_weight_cache_daemon(
@@ -598,13 +654,16 @@ def run_weight_cache_daemon(
     """Entry point for running a weight cache daemon process."""
     logging.basicConfig(
         level=logging.INFO,
-        format=f"%(asctime)s [Daemon gpu={gpu_id} tp_rank={tp_rank}] %(levelname)s %(message)s",
+        format=(
+            f"%(asctime)s [Daemon gpu={gpu_id} tp_rank={tp_rank}] "
+            "%(levelname)s %(message)s"
+        ),
     )
 
     # Die if our parent (the engine or the standalone launcher that spawned us)
     # dies, even on SIGKILL/OOM-kill. Without this an orphaned daemon keeps a
-    # full weight copy pinned in GPU memory and its live-PID .ready file blocks
-    # the next launch — the opposite of fast recovery.
+    # full weight copy pinned in GPU memory and its live kernel claim blocks
+    # the next launch.
     from sglang.srt.utils import kill_itself_when_parent_died
 
     kill_itself_when_parent_died()
@@ -616,9 +675,11 @@ def run_weight_cache_daemon(
         pp_rank=pp_rank,
         dist_init_method=dist_init_method,
     )
-
-    daemon.load()
-    daemon.serve()
+    try:
+        daemon.load()
+        daemon.serve()
+    finally:
+        daemon.shutdown()
 
 
 def spawn_weight_cache_daemon(
@@ -629,7 +690,13 @@ def spawn_weight_cache_daemon(
     pp_rank: int,
     dist_init_method: str,
 ):
-    """Start one daemon from the complete resolved server configuration."""
+    """Start one daemon from the complete resolved server configuration.
+
+    Uses ``multiprocessing`` with the ``spawn`` start method: the child starts
+    in a clean interpreter (no inherited CUDA context) and receives the
+    complete resolved ``ServerArgs`` through pickle, avoiding a second
+    hand-maintained CLI configuration path.
+    """
     ctx = multiprocessing.get_context("spawn")
     proc = ctx.Process(
         target=run_weight_cache_daemon,
@@ -642,8 +709,6 @@ def spawn_weight_cache_daemon(
 def launch_weight_cache_daemons(
     server_args: "ServerArgs",
     dist_init_method: Optional[str] = None,
-    timeout: int = 1800,
-    force: bool = False,
 ):
     """Launch weight cache daemon processes for this node's PP×TP ranks.
 
@@ -702,12 +767,6 @@ def launch_weight_cache_daemons(
             free_port = s.getsockname()[1]
         dist_init_method = f"tcp://127.0.0.1:{free_port}"
 
-    # Validate and clean up stale .ready/.sock files from prior runs.
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
-            cleanup_stale_daemon_files(global_rank, force=force)
-
     procs = []
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
@@ -732,54 +791,27 @@ def launch_weight_cache_daemons(
                 f"pp_rank={pp_rank} tp_rank={tp_rank} pid={proc.pid}"
             )
 
-    # Wait for all daemons on this node to become ready
+    # Readiness is the identity socket itself; clients perform bounded retries.
+    # The launcher only detects children that exit before it starts monitoring.
     num_daemons = len(procs)
-    check_interval = 2
-    start_time = time.time()
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
-            ready_path = get_ready_path(global_rank)
-            while not os.path.exists(ready_path):
-                time.sleep(check_interval)
-                if time.time() - start_time > timeout:
-                    logger.error(
-                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                        f"did not become ready within {timeout}s"
-                    )
-                    for p in procs:
-                        p.terminate()
-                    raise TimeoutError(
-                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                        f"did not become ready within {timeout}s"
-                    )
-                # Check if any daemon exited prematurely
-                for p in procs:
-                    if not p.is_alive():
-                        logger.error(
-                            f"Weight cache daemon exited prematurely "
-                            f"with code {p.exitcode}"
-                        )
-                        for other in procs:
-                            if other.is_alive():
-                                other.terminate()
-                        raise RuntimeError(
-                            f"Weight cache daemon exited prematurely "
-                            f"with code {p.exitcode}"
-                        )
-            logger.info(
-                f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} is ready"
-            )
+
+    def _terminate_and_reap_daemons() -> None:
+        for child in procs:
+            if child.is_alive():
+                child.terminate()
+        for child in procs:
+            child.join(timeout=5)
+            if child.is_alive():
+                child.kill()
+                child.join()
 
     logger.info(
-        f"All {num_daemons} weight cache daemons on node {server_args.node_rank} are ready "
-        f"(pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
-        f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
-        f"dist_init_method={dist_init_method})"
+        "Launched %s weight-cache daemons; clients wait for socket readiness",
+        num_daemons,
     )
 
-    # Monitor daemons and, the moment any one exits, terminate the rest and
-    # raise. A serial proc.join() would not notice a
+    # Monitor daemons — poll all of them and, the moment any one exits,
+    # terminate the rest and raise. A serial proc.join() would not notice a
     # mid-list death (e.g. procs[1] dying while procs[0] is still alive) until
     # the earlier proc happened to exit, and it never surfaced the failure.
     exited = None
@@ -795,14 +827,7 @@ def launch_weight_cache_daemons(
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down daemons")
     finally:
-        for proc in procs:
-            if proc.is_alive():
-                proc.terminate()
-        for proc in procs:
-            proc.join(timeout=5)
-            if proc.is_alive():
-                proc.kill()
-                proc.join()
+        _terminate_and_reap_daemons()
         logger.info("All weight cache daemons have been terminated")
 
     if exited is not None:
@@ -832,10 +857,6 @@ if __name__ == "__main__":
             if daemon_args.tp_rank is not None
             else daemon_args.gpu_id
         )
-        cleanup_stale_daemon_files(
-            compute_global_rank(server_args.tp_size, daemon_args.pp_rank, tp_rank),
-            force=daemon_args.force,
-        )
         run_weight_cache_daemon(
             server_args,
             gpu_id=gpu_id,
@@ -847,6 +868,4 @@ if __name__ == "__main__":
         launch_weight_cache_daemons(
             server_args,
             dist_init_method=daemon_args.dist_init_method,
-            timeout=daemon_args.timeout,
-            force=daemon_args.force,
         )
