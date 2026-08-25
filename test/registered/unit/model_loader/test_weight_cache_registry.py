@@ -14,7 +14,12 @@ import weakref
 from unittest import mock
 
 from sglang.srt.weight_cache import registry
-from sglang.srt.weight_cache.protocol import CACHE_IDENTITY_FIELDS, CacheConfig
+from sglang.srt.weight_cache.protocol import (
+    CACHE_COMPAT_ONLY_FIELDS,
+    CACHE_IDENTITY_FIELDS,
+    WEIGHT_CACHE_FORMAT_VERSION,
+    CacheConfig,
+)
 from sglang.srt.weight_cache.registry import (
     IdentityLock,
     identity_for,
@@ -54,7 +59,7 @@ def _config(**overrides) -> CacheConfig:
         "resolved_revision": "",
         "device_capability": "8.0",
         "torch_version": "2.5.1",
-        "sglang_version": "0.4.0",
+        "cache_format_version": WEIGHT_CACHE_FORMAT_VERSION,
         "load_format": "auto",
         "model_loader_extra_config_hash": "",
         "trust_remote_code": False,
@@ -64,10 +69,30 @@ def _config(**overrides) -> CacheConfig:
 
 
 class TestCacheIdentity(CustomTestCase):
-    def test_allowlist_covers_every_cacheconfig_field(self):
-        # Every CacheConfig field must be a deliberate identity decision, not
-        # silently included or omitted as fields are added later.
-        self.assertEqual(set(CACHE_IDENTITY_FIELDS), set(CacheConfig.__struct_fields__))
+    def test_identity_and_compat_partition_every_cacheconfig_field(self):
+        # Every CacheConfig field must be a deliberate identity-or-compat
+        # decision, not silently included or omitted as fields are added
+        # later, and never both (a compat field folded into identity would
+        # silently narrow the flock's mutual-exclusion domain).
+        identity = set(CACHE_IDENTITY_FIELDS)
+        compat = set(CACHE_COMPAT_ONLY_FIELDS)
+        self.assertEqual(identity & compat, set())
+        self.assertEqual(identity | compat, set(CacheConfig.__struct_fields__))
+
+    def test_version_and_environment_fields_do_not_affect_identity(self):
+        # These answer "can this consumer use this producer's export", not
+        # "are these the same weights" -- they must stay out of the identity
+        # hash or a routine sglang upgrade would make a live daemon invisible
+        # to a new client and risk a duplicate GPU load. See daemon.py's
+        # _daemon_metadata for the (uncompared) sglang_version diagnostic.
+        base = identity_for(_config(), "GPU-compat-only")
+        for field, value in (
+            ("device_capability", "9.0"),
+            ("torch_version", "2.4.0"),
+            ("cache_format_version", 999),
+        ):
+            other = identity_for(_config(**{field: value}), "GPU-compat-only")
+            self.assertEqual(base.key, other.key, msg=f"{field} changed identity")
 
     def test_allowlist_excludes_dp_rank(self):
         # DP replicas on one GPU must share a daemon; see registry.py's

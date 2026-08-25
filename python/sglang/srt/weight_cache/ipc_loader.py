@@ -24,6 +24,7 @@ from sglang.srt.model_loader.loader import (
 )
 
 from .protocol import (
+    WEIGHT_CACHE_FORMAT_VERSION,
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
@@ -49,6 +50,11 @@ logger = logging.getLogger(__name__)
 
 # How often the client polls the serving daemon's PID for liveness.
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
+
+# Bound on _fetch_from_cache's socket-appeared-mid-wait retries. Each retry is
+# a real state transition (the socket showed up), not a poll, so this only
+# caps a pathological crash-looping daemon, not normal operation.
+_FETCH_FROM_CACHE_MAX_ATTEMPTS = 50
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -445,7 +451,6 @@ class IpcModelLoader(BaseModelLoader):
 
     def _build_engine_config(self, model_config, device_id: int) -> CacheConfig:
         from sglang.srt.runtime_context import get_exec, get_parallel
-        from sglang.version import __version__ as sglang_version
 
         ps = get_parallel()
         quant_method, quant_config = self._resolve_engine_quant(model_config)
@@ -485,7 +490,7 @@ class IpcModelLoader(BaseModelLoader):
                 self.load_config.model_loader_extra_config
             ),
             trust_remote_code=self.load_config.weight_cache_trust_remote_code,
-            sglang_version=sglang_version,
+            cache_format_version=WEIGHT_CACHE_FORMAT_VERSION,
             **compute_env_stamp(device_id),
         )
 
@@ -582,111 +587,130 @@ class IpcModelLoader(BaseModelLoader):
         )
 
     def _fetch_from_cache(self, model_config, device_config) -> Optional[dict]:
-        """Discover/connect, bind the handshake to that daemon, then fetch."""
+        """Discover/connect, bind the handshake to that daemon, then fetch.
+
+        A socket that appears mid-wait retries the same identity rather than
+        falling back to disk. Bounded, not recursive: an unsupervised
+        crash-looping daemon would otherwise let each retry recurse forever.
+        """
         import socket as socket_mod
 
         from sglang.srt.platforms import current_platform
 
         # DeviceConfig is required for every real load path. Do not silently
-        # substitute GPU 0: physical-device identity is the cache key.
+        # substitute GPU 0: physical-device identity is the cache key. Computed
+        # once: a retry must keep chasing the identity it started with, not
+        # recompute it against a model_config that could mutate mid-retry.
         device_id = int(device_config.gpu_id)
         engine_config = self._build_engine_config(model_config, device_id)
         device_uuid = current_platform.get_device_uuid(device_id)
         identity = identity_for(engine_config, device_uuid)
         socket_path = self.socket_path or identity_socket_path(identity)
 
-        # Only connect to a real socket node owned by us: reject a symlink, a
-        # plain file, or another user's socket planted at this /tmp path. An
-        # absent socket means no daemon -> fall back to disk (return None).
-        try:
-            st = os.lstat(socket_path)
-        except FileNotFoundError:
-            if not self._claim_fallback_or_wait(identity, socket_path):
-                return self._fetch_from_cache(model_config, device_config)
-            logger.info(f"[IpcModelLoader] Daemon socket not found at {socket_path}.")
-            return None
-        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
-            raise RuntimeError(
-                f"[IpcModelLoader] Refusing to connect: {socket_path} is not "
-                f"a socket owned by this user."
-            )
-
-        sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
-        try:
-            sock.settimeout(30)
-            sock.connect(socket_path)
-        except FileNotFoundError:
-            sock.close()
-            if not self._claim_fallback_or_wait(
-                identity, socket_path, allow_ready_socket=False
-            ):
-                return self._fetch_from_cache(model_config, device_config)
-            return None
-        except ConnectionRefusedError:
-            sock.close()
-            if not self._claim_fallback_or_wait(
-                identity, socket_path, allow_ready_socket=False
-            ):
-                return self._fetch_from_cache(model_config, device_config)
-            return None
-        except Exception as e:
-            sock.close()
-            raise RuntimeError(
-                f"[IpcModelLoader] Failed to connect to daemon at {socket_path}: {e}"
-            ) from e
-
-        try:
-            logger.info(
-                f"[IpcModelLoader] Requesting weights from daemon at "
-                f"{socket_path} with config: "
-                f"model={engine_config.model_path}, "
-                f"arch={engine_config.model_arch}, "
-                f"tp={engine_config.tp_size}/{engine_config.tp_rank}, "
-                f"quant={engine_config.quant_method}, "
-                f"dtype={engine_config.dtype}"
-            )
-
-            send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
-            result = recv_msg(sock)
-
-            if result.get("status") != "ok":
-                daemon_config = result.get("daemon_config", {})
+        for _ in range(_FETCH_FROM_CACHE_MAX_ATTEMPTS):
+            # Only connect to a real socket node owned by us: reject a symlink,
+            # a plain file, or another user's socket planted at this /tmp path.
+            # An absent socket means no daemon -> fall back to disk (None).
+            try:
+                st = os.lstat(socket_path)
+            except FileNotFoundError:
+                if not self._claim_fallback_or_wait(identity, socket_path):
+                    continue
+                logger.info(
+                    f"[IpcModelLoader] Daemon socket not found at {socket_path}."
+                )
+                return None
+            if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
                 raise RuntimeError(
-                    f"[IpcModelLoader] Daemon config mismatch!\n"
-                    f"  Engine config: {engine_config.to_dict()}\n"
-                    f"  Daemon config: {daemon_config}"
+                    f"[IpcModelLoader] Refusing to connect: {socket_path} is not "
+                    f"a socket owned by this user."
                 )
 
-            # Validate the returned config and physical/process identity before
-            # importing any tensor mappings.
-            self._verify_response_identity(
-                result,
-                engine_config=engine_config,
-                device_uuid=device_uuid,
-            )
+            sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            try:
+                sock.settimeout(30)
+                sock.connect(socket_path)
+            except FileNotFoundError:
+                sock.close()
+                if not self._claim_fallback_or_wait(
+                    identity, socket_path, allow_ready_socket=False
+                ):
+                    continue
+                return None
+            except ConnectionRefusedError:
+                sock.close()
+                if not self._claim_fallback_or_wait(
+                    identity, socket_path, allow_ready_socket=False
+                ):
+                    continue
+                return None
+            except Exception as e:
+                sock.close()
+                raise RuntimeError(
+                    f"[IpcModelLoader] Failed to connect to daemon at "
+                    f"{socket_path}: {e}"
+                ) from e
 
-            backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
-            self._transport_backend = get_client_transport_backend(backend_name)
-            result = self._transport_backend.recv_fetch_state_response(sock, result)
+            try:
+                logger.info(
+                    f"[IpcModelLoader] Requesting weights from daemon at "
+                    f"{socket_path} with config: "
+                    f"model={engine_config.model_path}, "
+                    f"arch={engine_config.model_arch}, "
+                    f"tp={engine_config.tp_size}/{engine_config.tp_rank}, "
+                    f"quant={engine_config.quant_method}, "
+                    f"dtype={engine_config.dtype}"
+                )
 
-            return result
+                send_msg(
+                    sock, {"type": "fetch_state", "config": engine_config.to_dict()}
+                )
+                result = recv_msg(sock)
 
-        except (ConnectionError, OSError) as e:
-            # Only a transport failure implies the producer may have died and
-            # released EX. A declared mismatch or bad response is a real error
-            # and should propagate, not get swallowed into a disk load.
-            if not self._claim_fallback_or_wait(
-                identity, socket_path, allow_ready_socket=False
-            ):
-                return self._fetch_from_cache(model_config, device_config)
-            logger.warning(
-                "[IpcModelLoader] Daemon communication failed and its identity "
-                "claim was released; falling back to a private disk load: %s",
-                e,
-            )
-            return None
-        finally:
-            sock.close()
+                if result.get("status") != "ok":
+                    daemon_config = result.get("daemon_config", {})
+                    raise RuntimeError(
+                        f"[IpcModelLoader] Daemon config mismatch!\n"
+                        f"  Engine config: {engine_config.to_dict()}\n"
+                        f"  Daemon config: {daemon_config}"
+                    )
+
+                # Validate the returned config and physical/process identity
+                # before importing any tensor mappings.
+                self._verify_response_identity(
+                    result,
+                    engine_config=engine_config,
+                    device_uuid=device_uuid,
+                )
+
+                backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
+                self._transport_backend = get_client_transport_backend(backend_name)
+                return self._transport_backend.recv_fetch_state_response(sock, result)
+
+            except (ConnectionError, OSError) as e:
+                # Only a transport failure implies the producer may have died
+                # and released EX. A declared mismatch or bad response is a
+                # real error and should propagate, not get swallowed into a
+                # disk load.
+                if not self._claim_fallback_or_wait(
+                    identity, socket_path, allow_ready_socket=False
+                ):
+                    continue
+                logger.warning(
+                    "[IpcModelLoader] Daemon communication failed and its "
+                    "identity claim was released; falling back to a private "
+                    "disk load: %s",
+                    e,
+                )
+                return None
+            finally:
+                sock.close()
+
+        raise RuntimeError(
+            f"[IpcModelLoader] gave up on weight-cache identity {identity.key} "
+            f"after {_FETCH_FROM_CACHE_MAX_ATTEMPTS} socket-appeared-mid-wait "
+            f"retries"
+        )
 
     def _fallback_load(self, model_config, device_config) -> nn.Module:
         """Fall back to DefaultModelLoader for disk-based loading."""

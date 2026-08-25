@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weight Cache Daemon — a persistent process that holds post-quantized,
-TP-sharded model weights in GPU memory and serves them via CUDA IPC handles.
+TP-sharded model weights in GPU memory and serves them over a pluggable
+transport backend (CUDA IPC by default; see transport.py).
 
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
-2. Exports every parameter/buffer as a CUDA IPC handle
+2. Exports every parameter/buffer via the chosen transport backend
 3. Serves handles over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
 
@@ -43,7 +44,7 @@ import os
 import signal
 import socket
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import psutil
 import torch
@@ -54,6 +55,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, publish
 
 from .protocol import (
+    WEIGHT_CACHE_FORMAT_VERSION,
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
@@ -276,7 +278,6 @@ class WeightCacheDaemon:
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
-        from sglang.version import __version__ as sglang_version
 
         server_args = self.server_args
         # ServerArgs resolves source-specific "auto" values (for example
@@ -356,7 +357,7 @@ class WeightCacheDaemon:
                 self.model_loader_extra_config
             ),
             trust_remote_code=self.trust_remote_code,
-            sglang_version=sglang_version,
+            cache_format_version=WEIGHT_CACHE_FORMAT_VERSION,
             **compute_env_stamp(self.gpu_id),
         )
 
@@ -462,7 +463,7 @@ class WeightCacheDaemon:
         )
         state_dict_names = set(self.model.state_dict().keys())
 
-        state_tensors = {}
+        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {}
         # Export all items from state_dict (parameters + persistent buffers)
         for name, tensor in self.model.state_dict().items():
             state_tensors[name] = (tensor.data, name in param_names)
@@ -560,11 +561,16 @@ class WeightCacheDaemon:
     def _daemon_metadata(self) -> Dict[str, Any]:
         if self.identity is None:
             raise RuntimeError("weight cache daemon identity is unavailable")
+        from sglang.version import __version__ as sglang_version
+
         return {
             "device_uuid": self.identity.device_uuid,
             "config_fingerprint": self.identity.config_fingerprint,
             "pid": os.getpid(),
             "process_start_time": float(psutil.Process().create_time()),
+            # Diagnostics only -- not part of identity or compared. See
+            # WEIGHT_CACHE_FORMAT_VERSION for the actual compatibility check.
+            "sglang_version": sglang_version,
         }
 
     def _handle_connection(self, conn: socket.socket):
@@ -583,8 +589,19 @@ class WeightCacheDaemon:
             )
 
         elif req.get("type") == "fetch_state":
-            # Client requests full state with IPC handles
-            engine_config = CacheConfig.from_dict(req["config"])
+            # A wire dict missing a required field (e.g. cache_format_version)
+            # is a compatibility mismatch, not a transport error.
+            try:
+                engine_config = CacheConfig.from_dict(req["config"])
+            except (TypeError, KeyError) as e:
+                logger.warning(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                    f"Malformed client config: {e}"
+                )
+                send_msg(
+                    conn, {"status": "mismatch", "daemon_config": self.config.to_dict()}
+                )
+                return
             if not self.config.matches(engine_config):
                 # Log detailed mismatch info for debugging
                 daemon_dict = self.config.to_dict()
@@ -790,16 +807,6 @@ def launch_weight_cache_daemons(
     # The launcher only detects children that exit before it starts monitoring.
     num_daemons = len(procs)
 
-    def _terminate_and_reap_daemons() -> None:
-        for child in procs:
-            if child.is_alive():
-                child.terminate()
-        for child in procs:
-            child.join(timeout=5)
-            if child.is_alive():
-                child.kill()
-                child.join()
-
     logger.info(
         "Launched %s weight-cache daemons; clients wait for socket readiness",
         num_daemons,
@@ -822,7 +829,14 @@ def launch_weight_cache_daemons(
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down daemons")
     finally:
-        _terminate_and_reap_daemons()
+        for child in procs:
+            if child.is_alive():
+                child.terminate()
+        for child in procs:
+            child.join(timeout=5)
+            if child.is_alive():
+                child.kill()
+                child.join()
         logger.info("All weight cache daemons have been terminated")
 
     if exited is not None:

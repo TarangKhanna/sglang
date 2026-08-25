@@ -30,6 +30,7 @@ import torch
 
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
+    WEIGHT_CACHE_FORMAT_VERSION,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
@@ -77,7 +78,7 @@ def _make_cache_config(**overrides) -> CacheConfig:
         resolved_revision="",
         device_capability="8.0",
         torch_version="2.5.1",
-        sglang_version="0.4.0",
+        cache_format_version=WEIGHT_CACHE_FORMAT_VERSION,
         load_format="auto",
         model_loader_extra_config_hash="",
         trust_remote_code=False,
@@ -174,6 +175,11 @@ class TestCacheConfig(CustomTestCase):
     def test_identical_configs_match(self):
         self.assertTrue(_make_cache_config().matches(_make_cache_config()))
 
+    def test_format_version_change_is_a_deliberate_reviewed_bump(self):
+        # A silent bump would change compatibility semantics for every
+        # daemon/client pair without a corresponding review.
+        self.assertEqual(WEIGHT_CACHE_FORMAT_VERSION, 1)
+
     def test_any_field_difference_breaks_match(self):
         base = _make_cache_config()
         for field, value in (
@@ -192,7 +198,7 @@ class TestCacheConfig(CustomTestCase):
             ("trust_remote_code", True),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
-            ("sglang_version", "0.3.0"),
+            ("cache_format_version", 2),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -373,11 +379,136 @@ class TestDaemonShutdownKeepsClaim(CustomTestCase):
         self.assertTrue(instance.claim_lock.acquire(fcntl.LOCK_EX))
         self.addCleanup(instance.claim_lock.release)
 
-        with mock.patch.object(daemon_module.dist, "is_initialized", return_value=False):
+        with mock.patch.object(
+            daemon_module.dist, "is_initialized", return_value=False
+        ):
             instance.shutdown()
 
         contender = IdentityLock(identity)
         self.assertFalse(contender.acquire(fcntl.LOCK_EX))
+
+
+class TestMissingCompatFieldFailsClosed(CustomTestCase):
+    """cache_format_version has no default: a peer whose wire dict omits it
+    must be rejected, not silently backfilled with the local version."""
+
+    def test_daemon_rejects_a_config_dict_missing_the_field(self):
+        from sglang.srt.weight_cache import daemon as daemon_module
+
+        server_args = SimpleNamespace(
+            model_path="/models/demo",
+            tp_size=1,
+            pp_size=1,
+            dp_size=1,
+            ep_size=1,
+            moe_dp_size=1,
+            enable_dp_attention=False,
+            enable_dp_lm_head=False,
+            attn_cp_size=1,
+            moe_dense_tp_size=1,
+            moe_a2a_backend="none",
+            deepep_mode="auto",
+            load_format="auto",
+            dtype="bfloat16",
+            quantization=None,
+            model_loader_extra_config=None,
+            trust_remote_code=False,
+            revision=None,
+        )
+        instance = daemon_module.WeightCacheDaemon(
+            server_args=server_args, gpu_id=0, tp_rank=0, pp_rank=0
+        )
+        instance.config = _make_cache_config()
+
+        incomplete = _make_cache_config().to_dict()
+        del incomplete["cache_format_version"]
+
+        a, b = socket.socketpair()
+        try:
+            send_msg(a, {"type": "fetch_state", "config": incomplete})
+            instance._handle_connection(b)
+            response = recv_msg(a)
+        finally:
+            a.close()
+            b.close()
+
+        self.assertEqual(response["status"], "mismatch")
+
+    def test_client_rejects_a_daemon_response_missing_the_field(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        engine_config = _make_cache_config()
+        incomplete = _make_cache_config().to_dict()
+        del incomplete["cache_format_version"]
+
+        with self.assertRaises(RuntimeError):
+            IpcModelLoader._verify_response_identity(
+                {
+                    "config": incomplete,
+                    "daemon": {
+                        "device_uuid": "GPU-0",
+                        "config_fingerprint": engine_config.fingerprint(),
+                        "pid": 1,
+                        "process_start_time": 1.0,
+                    },
+                },
+                engine_config=engine_config,
+                device_uuid="GPU-0",
+            )
+
+
+class TestPartialDaemonSpawnFailureTerminatesSiblings(CustomTestCase):
+    def test_a_later_ranks_spawn_failure_terminates_earlier_daemons(self):
+        from unittest import mock
+
+        from sglang.srt.entrypoints.engine import Engine
+
+        server_args = SimpleNamespace(
+            nnodes=1,
+            node_rank=0,
+            tp_size=2,
+            dist_init_addr=None,
+            base_gpu_id=0,
+            gpu_id_step=1,
+        )
+
+        class FakeProc:
+            def __init__(self, rank):
+                self.rank = rank
+                self.terminated = False
+
+            def is_alive(self):
+                return not self.terminated
+
+            def terminate(self):
+                self.terminated = True
+
+            def join(self, timeout=None):
+                pass
+
+        spawned = []
+
+        def fake_spawn(_server_args, *, gpu_id, tp_rank, pp_rank, dist_init_method):
+            if tp_rank == 1:
+                raise RuntimeError("second daemon failed to spawn")
+            proc = FakeProc(tp_rank)
+            spawned.append(proc)
+            return proc
+
+        with mock.patch(
+            "sglang.srt.weight_cache.daemon.spawn_weight_cache_daemon",
+            side_effect=fake_spawn,
+        ), mock.patch(
+            "sglang.srt.entrypoints.engine.get_model",
+            return_value=SimpleNamespace(model_path="/models/demo"),
+        ), mock.patch(
+            "sglang.srt.entrypoints.engine.configured_pp_size", return_value=1
+        ):
+            with self.assertRaises(RuntimeError):
+                Engine._launch_weight_cache_daemons(server_args)
+
+        self.assertEqual(len(spawned), 1)
+        self.assertTrue(spawned[0].terminated)
 
 
 class TestIpcQuantAllowlist(CustomTestCase):
@@ -768,6 +899,88 @@ class TestClaimFallbackOrWaitDaemonRace(CustomTestCase):
 
         loader._fallback_load.assert_not_called()
 
+    def test_compat_only_skew_reaches_the_same_socket_and_fails_loudly(self):
+        """device_capability/torch_version/cache_format_version are excluded
+        from identity on purpose: a client and a daemon that differ only in
+        one of these compute the same identity, so they connect to the same
+        socket and hit the handshake mismatch -- not a silent discovery miss
+        that would let the client disk-load a duplicate copy."""
+        import socket as socket_mod
+        import tempfile
+        import threading
+        from unittest import mock
+
+        from sglang.srt.weight_cache.registry import identity_for, socket_path
+
+        engine_config = _make_cache_config(torch_version="2.5.1")
+        daemon_config = _make_cache_config(torch_version="2.6.0")
+        identity = identity_for(engine_config, "GPU-compat-skew")
+        self.assertEqual(
+            identity.key,
+            identity_for(daemon_config, "GPU-compat-skew").key,
+            "a torch_version-only difference must not change identity",
+        )
+
+        with tempfile.TemporaryDirectory(
+            dir="/tmp", prefix="wc-"
+        ) as runtime_dir, mock.patch(
+            "sglang.srt.weight_cache.registry._RUNTIME_DIR", runtime_dir
+        ):
+            listener_path = socket_path(identity)
+            listener = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            listener.bind(listener_path)
+            listener.listen(1)
+            self.addCleanup(listener.close)
+
+            def _reply_as_the_real_daemon_would():
+                conn, _ = listener.accept()
+                try:
+                    req = recv_msg(conn)
+                    assert req["type"] == "fetch_state"
+                    requesting_config = CacheConfig.from_dict(req["config"])
+                    if daemon_config.matches(requesting_config):
+                        send_msg(conn, {"status": "ok"})
+                    else:
+                        send_msg(
+                            conn,
+                            {
+                                "status": "mismatch",
+                                "daemon_config": daemon_config.to_dict(),
+                            },
+                        )
+                finally:
+                    conn.close()
+
+            server = threading.Thread(
+                target=_reply_as_the_real_daemon_would, daemon=True
+            )
+            server.start()
+            self.addCleanup(server.join, 1.0)
+
+            loader = self._loader("client")
+            loader._build_engine_config = mock.Mock(return_value=engine_config)
+            loader._fallback_load = mock.Mock(
+                side_effect=AssertionError("compat skew must not disk load")
+            )
+            model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"], quantization_config=None
+                ),
+                quantization=None,
+            )
+
+            with mock.patch(
+                "sglang.srt.platforms.current_platform.get_device_uuid",
+                return_value="GPU-compat-skew",
+            ), mock.patch("sglang.srt.weight_cache.ipc_loader.check_ipc_quant_support"):
+                with self.assertRaisesRegex(RuntimeError, "Daemon config mismatch"):
+                    loader.load_model(
+                        model_config=model_config,
+                        device_config=SimpleNamespace(gpu_id=0),
+                    )
+
+        loader._fallback_load.assert_not_called()
+
     def test_daemon_mode_attaches_once_the_socket_appears_mid_wait(self):
         """The positive path this whole class exists to protect: a
         co-terminal daemon that's merely slow to claim still lets the
@@ -943,86 +1156,78 @@ class TestFallbackClaimSurvivesDiskLoad(CustomTestCase):
         self.assertIsNone(loader._fallback_claim)
 
 
-class TestWaitForReadyWatchingDaemons(CustomTestCase):
-    """Composed entirely around scheduler_init_result.wait_for_ready() in
-    _launch_subprocesses -- _wait_for_scheduler_ready and
-    _launch_scheduler_processes (an override point subclasses like RayEngine
-    use) stay at their upstream signatures and never learn about weight-cache
-    daemons at all."""
+class TestSchedulerReadyExtraLivenessProcs(CustomTestCase):
+    """extra_liveness_procs is _wait_for_scheduler_ready's own daemon-death
+    check, folded into its existing poll(timeout=5.0) loop -- no separate
+    thread or wrapper, and _launch_scheduler_processes (an override point
+    subclasses like RayEngine use) never learns about weight-cache daemons."""
 
-    def test_skips_the_watcher_entirely_with_no_daemons(self):
-        """No thread, no polling -- just the plain call, so non-weight-cache
-        launches (the overwhelming common case) pay nothing extra."""
-        from sglang.srt.entrypoints.engine import _wait_for_ready_watching_daemons
+    class _FakeReader:
+        def __init__(self, ready_after: int, payload):
+            self._polls_left = ready_after
+            self._payload = payload
 
-        calls = []
-        result = SimpleNamespace(wait_for_ready=lambda: calls.append(1))
+        def poll(self, timeout=None):
+            if self._polls_left > 0:
+                self._polls_left -= 1
+                return False
+            return True
 
-        _wait_for_ready_watching_daemons(result, None)
-        _wait_for_ready_watching_daemons(result, [])
-        self.assertEqual(calls, [1, 1])
+        def recv(self):
+            return self._payload
 
-    def test_raises_promptly_when_a_watched_daemon_dies(self):
-        from unittest import mock
+    class _FakeProc:
+        def __init__(self, pid, exitcode=None, alive=True):
+            self.pid = pid
+            self.exitcode = exitcode
+            self._alive = alive
 
-        from sglang.srt.entrypoints import engine as engine_module
-        from sglang.srt.entrypoints.engine import _wait_for_ready_watching_daemons
+        def is_alive(self):
+            return self._alive
 
-        # wait_for_ready() would block forever (simulating the scheduler
-        # stuck waiting on the daemon's socket) -- the death check must fire
-        # without waiting for it.
-        result = SimpleNamespace(wait_for_ready=lambda: time.sleep(3600))
+    def test_no_extra_procs_behaves_like_the_bare_call(self):
+        from sglang.srt.entrypoints.engine import _wait_for_scheduler_ready
 
-        dead_daemon = mock.Mock(pid=222, exitcode=1)
-        dead_daemon.is_alive.return_value = False
+        reader = self._FakeReader(0, {"status": "ready"})
+        proc = self._FakeProc(pid=1)
+        self.assertEqual(
+            _wait_for_scheduler_ready([reader], [proc]), [{"status": "ready"}]
+        )
 
-        with mock.patch.object(
-            engine_module, "_DAEMON_LIVENESS_WATCH_INTERVAL_S", 0.05
-        ):
-            start = time.monotonic()
-            with self.assertRaises(RuntimeError) as ctx:
-                _wait_for_ready_watching_daemons(result, [dead_daemon])
-            elapsed = time.monotonic() - start
-        self.assertIn("222", str(ctx.exception))
-        self.assertLess(elapsed, 1.0)
+    def test_raises_promptly_when_an_extra_proc_dies(self):
+        from sglang.srt.entrypoints.engine import _wait_for_scheduler_ready
 
-    def test_does_not_raise_while_watched_daemons_stay_alive(self):
-        from unittest import mock
-
-        from sglang.srt.entrypoints import engine as engine_module
-        from sglang.srt.entrypoints.engine import _wait_for_ready_watching_daemons
-
-        # wait_for_ready() takes a couple of poll cycles to finish -- a live
-        # daemon must not trip the death check in the meantime.
-        result = SimpleNamespace(wait_for_ready=lambda: time.sleep(0.15))
-
-        healthy_daemon = mock.Mock(pid=333)
-        healthy_daemon.is_alive.return_value = True
-
-        with mock.patch.object(
-            engine_module, "_DAEMON_LIVENESS_WATCH_INTERVAL_S", 0.05
-        ):
-            _wait_for_ready_watching_daemons(result, [healthy_daemon])
-        # No exception -- reaching here is the assertion.
-
-    def test_propagates_wait_for_ready_own_exception(self):
-        """A dead scheduler (wait_for_ready's own failure mode) must still
-        surface correctly even though a healthy daemon is also being
-        watched."""
-        from unittest import mock
-
-        from sglang.srt.entrypoints.engine import _wait_for_ready_watching_daemons
-
-        def _raise():
-            raise RuntimeError("scheduler died")
-
-        result = SimpleNamespace(wait_for_ready=_raise)
-        healthy_daemon = mock.Mock(pid=444)
-        healthy_daemon.is_alive.return_value = True
+        # Never becomes ready on its own -- the death check must fire first.
+        reader = self._FakeReader(10_000, {"status": "ready"})
+        scheduler_proc = self._FakeProc(pid=1)
+        dead_daemon = self._FakeProc(pid=222, exitcode=1, alive=False)
 
         with self.assertRaises(RuntimeError) as ctx:
-            _wait_for_ready_watching_daemons(result, [healthy_daemon])
-        self.assertEqual(str(ctx.exception), "scheduler died")
+            _wait_for_scheduler_ready([reader], [scheduler_proc], [dead_daemon])
+        self.assertIn("222", str(ctx.exception))
+
+    def test_does_not_raise_while_extra_procs_stay_alive(self):
+        from sglang.srt.entrypoints.engine import _wait_for_scheduler_ready
+
+        reader = self._FakeReader(2, {"status": "ready"})
+        scheduler_proc = self._FakeProc(pid=1)
+        healthy_daemon = self._FakeProc(pid=333, alive=True)
+
+        result = _wait_for_scheduler_ready([reader], [scheduler_proc], [healthy_daemon])
+        self.assertEqual(result, [{"status": "ready"}])
+
+    def test_propagates_the_schedulers_own_failure(self):
+        """A dead scheduler must still surface correctly even though a
+        healthy daemon is also being watched."""
+        from sglang.srt.entrypoints.engine import _wait_for_scheduler_ready
+
+        reader = self._FakeReader(0, {"status": "error"})
+        scheduler_proc = self._FakeProc(pid=1)
+        healthy_daemon = self._FakeProc(pid=444, alive=True)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _wait_for_scheduler_ready([reader], [scheduler_proc], [healthy_daemon])
+        self.assertIn("Initialization failed", str(ctx.exception))
 
 
 if __name__ == "__main__":

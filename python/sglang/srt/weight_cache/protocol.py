@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 # Cache identity must be deliberately reviewed when CacheConfig changes.
 # dp_rank must never be added: DP replicas on one GPU share a daemon.
+#
+# Identity answers "are these the same weights" -- it is hashed into the lock
+# and socket path, so it is also the flock mutual-exclusion domain. Fields
+# that only answer "can this consumer use this producer's export" belong in
+# CACHE_COMPAT_ONLY_FIELDS instead: folding a compatibility check into the
+# identity hash trades a loud, recoverable handshake mismatch for a silent
+# discovery miss that can double-load a GPU already holding the daemon's
+# weights (e.g. a routine sglang upgrade making a live daemon invisible).
 CACHE_IDENTITY_FIELDS = (
     "model_path",
     "model_arch",
@@ -42,13 +50,26 @@ CACHE_IDENTITY_FIELDS = (
     "dtype",
     "revision",
     "resolved_revision",
-    "device_capability",
-    "torch_version",
-    "sglang_version",
     "load_format",
     "model_loader_extra_config_hash",
     "trust_remote_code",
 )
+
+# Compared by CacheConfig.matches() but deliberately excluded from
+# CACHE_IDENTITY_FIELDS -- see the note above.
+CACHE_COMPAT_ONLY_FIELDS = (
+    "device_capability",
+    "torch_version",
+    "cache_format_version",
+)
+
+# Bump only when the daemon<->client contract for already-connected peers
+# changes: the tensor set WeightCacheDaemon._export_state produces, the entry
+# dict schema in transport.py, the "daemon already ran
+# process_weights_after_loading" skip contract in ipc_loader.py, or
+# IPC_QUANT_ALLOWLIST semantics. Not tied to the sglang release version, so a
+# routine upgrade doesn't orphan a live daemon.
+WEIGHT_CACHE_FORMAT_VERSION = 1
 
 
 def normalize_model_path_for_cache(model_path: str) -> str:
@@ -89,16 +110,19 @@ class CacheConfig(msgspec.Struct):
     dtype: str  # e.g. "torch.float16"
     revision: str  # model revision the weights were loaded from ("" if unset)
     resolved_revision: str  # immutable HF commit hash when available
-    # Environment stamp: a daemon and a client that ran different post-processing
-    # branches (different GPU compute capability or torch/kernel version) can
-    # produce incompatible weights that would map cleanly yet serve garbage.
-    # Comparing these turns that into a clean mismatch. See compute_env_stamp().
-    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
-    torch_version: str  # torch.__version__ of the process that built the weights
-    sglang_version: str  # exact build; restart a daemon across an upgrade
     load_format: str  # disk/source loader whose output is cached
     model_loader_extra_config_hash: str  # full SHA-256 of canonical loader options
     trust_remote_code: bool  # remote model code can change loaded tensor layout
+    # Environment stamp: a daemon and a client that ran different post-processing
+    # branches (different GPU compute capability or torch/kernel version) can
+    # produce incompatible weights that would map cleanly yet serve garbage.
+    # Compared at the handshake but not part of identity -- see
+    # CACHE_COMPAT_ONLY_FIELDS. See compute_env_stamp().
+    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
+    torch_version: str  # torch.__version__ of the process that built the weights
+    # Required, not defaulted: a peer's wire dict that omits this field must
+    # fail to construct rather than silently inherit the local version.
+    cache_format_version: int
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
